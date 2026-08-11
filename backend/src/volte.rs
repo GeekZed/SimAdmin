@@ -78,6 +78,20 @@ pub fn parse_qmi_packet_handle(output: &str) -> Option<String> {
     })
 }
 
+pub fn parse_qmi_connection_status(output: &str) -> Option<bool> {
+    output.lines().find_map(|line| {
+        let (label, value) = line.split_once(':')?;
+        if label.trim() != "Connection status" {
+            return None;
+        }
+        match value.trim().trim_matches('\'') {
+            "connected" => Some(true),
+            "disconnected" => Some(false),
+            _ => None,
+        }
+    })
+}
+
 pub async fn start_secondary_ims_bearer(
     qmi_device: &str,
     apn: &str,
@@ -141,6 +155,57 @@ pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBeare
         .ok_or_else(|| anyhow!("secondary IMS bearer did not provide IPv6 settings"))
 }
 
+pub async fn secondary_ims_bearer_connected(qmi_device: &str) -> Result<bool> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        Command::new("qmicli")
+            .args([
+                "-d",
+                qmi_device,
+                "--device-open-proxy",
+                "--wds-get-packet-service-status",
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out reading secondary IMS bearer status"))??;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "qmicli failed to read secondary IMS bearer status: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    parse_qmi_connection_status(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| anyhow!("secondary IMS bearer status was not recognized"))
+}
+
+pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) -> Result<()> {
+    if qmi_device.trim().is_empty() || packet_handle.trim().is_empty() {
+        return Err(anyhow!("QMI device and packet handle are required"));
+    }
+
+    let stop_arg = format!("--wds-stop-network={packet_handle}");
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("qmicli")
+            .args(["-d", qmi_device, "--device-open-proxy", &stop_arg])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out stopping secondary IMS bearer"))??;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "qmicli failed to stop secondary IMS bearer: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::RuntimeStatus;
@@ -171,6 +236,18 @@ mod tests {
         assert_eq!(
             super::parse_qmi_packet_handle("Packet data handle: '42'"),
             Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_qmi_connection_status() {
+        assert_eq!(
+            super::parse_qmi_connection_status("Connection status: 'connected'"),
+            Some(true)
+        );
+        assert_eq!(
+            super::parse_qmi_connection_status("Connection status: 'disconnected'"),
+            Some(false)
         );
     }
 }
