@@ -160,6 +160,41 @@ pub fn sip_status_code(response: &str) -> Option<u16> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityServer {
+    pub client_spi: u32,
+    pub server_spi: u32,
+    pub client_port: u16,
+    pub server_port: u16,
+}
+
+pub fn parse_security_server(response: &str) -> Option<SecurityServer> {
+    let header = response
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("security-server:"))?;
+    let value = header.split_once(':')?.1;
+    let parameter = |name: &str| {
+        value.split(';').find_map(|item| {
+            let (key, value) = item.trim().split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().trim_matches('"'))
+        })
+    };
+    let parse_u32 = |name: &str| {
+        let value = parameter(name)?;
+        u32::from_str_radix(value.trim_start_matches("0x"), 16)
+            .or_else(|_| value.parse())
+            .ok()
+    };
+    Some(SecurityServer {
+        client_spi: parse_u32("spi-c")?,
+        server_spi: parse_u32("spi-s")?,
+        client_port: parameter("port-c")?.parse().ok()?,
+        server_port: parameter("port-s")?.parse().ok()?,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AkaChallenge {
     pub realm: String,
     pub nonce: String,
@@ -174,6 +209,23 @@ pub fn build_security_client_header(
     format!(
         "Security-Client: ipsec-3gpp;prot=esp;mod=trans;spi-c=0x{client_spi:08x};spi-s=0x{server_spi:08x};port-c={client_port};port-s={server_port};alg=hmac-md5-96;ealg=null\r\n"
     )
+}
+
+pub fn build_register_with_security(
+    registration: &SipRegistration,
+    branch: &str,
+    security_header: &str,
+) -> Result<String> {
+    let request = build_register(registration, branch)?;
+    let marker = "Content-Length: 0\r\n";
+    let position = request
+        .find(marker)
+        .ok_or_else(|| anyhow!("SIP REGISTER content length header is missing"))?;
+    let mut secured = String::with_capacity(request.len() + security_header.len());
+    secured.push_str(&request[..position]);
+    secured.push_str(security_header);
+    secured.push_str(&request[position..]);
+    Ok(secured)
 }
 
 pub fn parse_aka_challenge(response: &str) -> Option<AkaChallenge> {
@@ -275,5 +327,19 @@ mod tests {
         let header = build_security_client_header(1, 2, 5062, 5060);
         assert!(header.contains("alg=hmac-md5-96;ealg=null"));
         assert!(header.contains("spi-c=0x00000001"));
+    }
+
+    #[test]
+    fn parses_security_server() {
+        let response = "Security-Server: ipsec-3gpp;prot=esp;mod=trans;spi-c=0x1;spi-s=0x2;port-c=5062;port-s=5060;alg=hmac-md5-96;ealg=null\r\n";
+        assert_eq!(
+            parse_security_server(response),
+            Some(SecurityServer {
+                client_spi: 1,
+                server_spi: 2,
+                client_port: 5062,
+                server_port: 5060
+            })
+        );
     }
 }
