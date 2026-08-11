@@ -35,7 +35,7 @@ impl EspSecurityAssociation {
         vec![
             "xfrm".into(),
             "state".into(),
-            "add".into(),
+            "replace".into(),
             "src".into(),
             self.local.to_string(),
             "dst".into(),
@@ -88,7 +88,7 @@ async fn install_policy(
         .args([
             "xfrm",
             "policy",
-            "add",
+            "replace",
             "dir",
             direction,
             "src",
@@ -193,6 +193,7 @@ mod tests {
     #[test]
     fn builds_transport_esp_arguments() {
         let args = sample().args();
+        assert_eq!(args[2], "replace");
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "mode" && pair[1] == "transport"));

@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
+use tokio::task::JoinHandle;
 
 use anyhow::{anyhow, Result};
 use crate::config::ConfigManager;
@@ -366,11 +367,17 @@ pub async fn run_secondary_ims_bearer_supervisor(
     notifications: Arc<NotificationSender>,
 ) {
     let mut active: Option<(String, String)> = None;
+    let mut sms_listener: Option<JoinHandle<()>> = None;
 
     loop {
         let volte = config.get_config().volte;
         if !volte.feature_enabled {
-            active = None;
+            if let Some(listener) = sms_listener.take() {
+                listener.abort();
+            }
+            if let Some((device, handle)) = active.take() {
+                let _ = stop_secondary_ims_bearer(&device, &handle).await;
+            }
             let _ = write_runtime_status(&RuntimeStatus {
                 phase: "disabled".to_string(),
                 transport: "native_qmi".to_string(),
@@ -408,7 +415,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
             });
             match start_secondary_ims_bearer(&device, "ims").await {
                 Ok((handle, settings)) => {
-                    active = Some((device, handle));
+                    active = Some((device.clone(), handle.clone()));
                     let mut pcscf_address = None;
                     let _ = write_runtime_status(&RuntimeStatus {
                         phase: "usim_aid_selecting".to_string(),
@@ -507,22 +514,24 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         match register_native_ims(&conn, &settings, pcscf).await {
                             Ok(()) => {
                                 registration_succeeded = true;
-                                let sms_local = settings.ipv6_address.parse().ok();
-                                if let Some(sms_local) = sms_local {
-                                    let database_clone = Arc::clone(&database);
-                                    let notifications_clone = Arc::clone(&notifications);
-                                    tokio::spawn(async move {
-                                        if let Err(error) = crate::ims_sms::run_ims_sms_listener(
-                                            sms_local,
-                                            5062,
-                                            database_clone,
-                                            notifications_clone,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(error = %error, "IMS SMS listener stopped");
-                                        }
-                                    });
+                                if volte.sms_enabled {
+                                    let sms_local = settings.ipv6_address.parse().ok();
+                                    if let Some(sms_local) = sms_local {
+                                        let database_clone = Arc::clone(&database);
+                                        let notifications_clone = Arc::clone(&notifications);
+                                        sms_listener = Some(tokio::spawn(async move {
+                                            if let Err(error) = crate::ims_sms::run_ims_sms_listener(
+                                                sms_local,
+                                                5062,
+                                                database_clone,
+                                                notifications_clone,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!(error = %error, "IMS SMS listener stopped");
+                                            }
+                                        }));
+                                    }
                                 }
                                 let _ = write_runtime_status(&RuntimeStatus {
                                     phase: "registered".to_string(),
@@ -545,6 +554,12 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         }
                     }
                     if !registration_succeeded {
+                        if let Some(listener) = sms_listener.take() {
+                            listener.abort();
+                        }
+                        if let Some((active_device, active_handle)) = active.take() {
+                            let _ = stop_secondary_ims_bearer(&active_device, &active_handle).await;
+                        }
                         let _ = write_runtime_status(&RuntimeStatus {
                             phase: "bearer_connected".to_string(),
                             transport: "native_qmi".to_string(),
@@ -573,6 +588,9 @@ pub async fn run_secondary_ims_bearer_supervisor(
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
             Ok(false) | Err(_) => {
+                if let Some(listener) = sms_listener.take() {
+                    listener.abort();
+                }
                 let _ = stop_secondary_ims_bearer(device, handle).await;
                 active = None;
                 let _ = write_runtime_status(&RuntimeStatus {
