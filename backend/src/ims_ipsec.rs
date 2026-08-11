@@ -76,6 +76,72 @@ pub async fn install_esp_state(sa: &EspSecurityAssociation) -> Result<()> {
     Ok(())
 }
 
+async fn install_policy(
+    direction: &str,
+    local: Ipv6Addr,
+    remote: Ipv6Addr,
+    spi: u32,
+) -> Result<()> {
+    let output = Command::new("ip")
+        .args([
+            "xfrm",
+            "policy",
+            "add",
+            "dir",
+            direction,
+            "src",
+            &format!("{local}/128"),
+            "dst",
+            &format!("{remote}/128"),
+            "tmpl",
+            "src",
+            &local.to_string(),
+            "dst",
+            &remote.to_string(),
+            "proto",
+            "esp",
+            "spi",
+            &format!("0x{spi:08x}"),
+            "mode",
+            "transport",
+        ])
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "failed to install IMS IPsec {direction} policy: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub async fn install_bidirectional_esp(
+    local: Ipv6Addr,
+    remote: Ipv6Addr,
+    client_spi: u32,
+    server_spi: u32,
+    ik_hex: &str,
+) -> Result<()> {
+    let outbound = EspSecurityAssociation {
+        local,
+        remote,
+        spi: client_spi,
+        auth_key_hex: ik_hex.to_string(),
+    };
+    let inbound = EspSecurityAssociation {
+        local: remote,
+        remote: local,
+        spi: server_spi,
+        auth_key_hex: ik_hex.to_string(),
+    };
+    install_esp_state(&outbound).await?;
+    install_esp_state(&inbound).await?;
+    install_policy("out", local, remote, client_spi).await?;
+    install_policy("in", remote, local, server_spi).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
