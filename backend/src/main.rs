@@ -36,6 +36,7 @@ mod esim;
 mod handlers;
 mod ims_ipsec;
 mod ims_sip;
+mod ims_sms;
 mod ims_uim;
 mod iptables;
 mod models;
