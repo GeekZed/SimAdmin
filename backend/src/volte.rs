@@ -238,14 +238,16 @@ pub async fn start_secondary_ims_bearer(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let handle = parse_qmi_packet_handle(&stdout)
         .ok_or_else(|| anyhow!("qmicli did not return a packet data handle"))?;
-    let settings = match read_secondary_bearer_settings(qmi_device).await {
-        Ok(settings) => settings,
-        Err(error) => {
-            let _ = stop_secondary_ims_bearer(qmi_device, &handle).await;
-            return Err(error);
+    let mut last_error = None;
+    for _ in 0..5 {
+        match read_secondary_bearer_settings(qmi_device).await {
+            Ok(settings) => return Ok((handle, settings)),
+            Err(error) => last_error = Some(error),
         }
-    };
-    Ok((handle, settings))
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let _ = stop_secondary_ims_bearer(qmi_device, &handle).await;
+    Err(last_error.unwrap_or_else(|| anyhow!("secondary IMS bearer settings unavailable")))
 }
 
 pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBearerSettings> {
