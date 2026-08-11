@@ -426,6 +426,14 @@ async fn main() -> Result<()> {
         });
     }
 
+    // beta9 native IMS bearer supervisor; disabled by default in config.
+    {
+        let config_clone = Arc::clone(&config_manager);
+        tokio::spawn(async move {
+            volte::run_secondary_ims_bearer_supervisor(config_clone).await;
+        });
+    }
+
     // 电话监听暂不启用
 
     // 自动初始化数据连接

@@ -7,10 +7,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
 use anyhow::{anyhow, Result};
+use crate::config::ConfigManager;
 
 pub const RUNTIME_STATUS_PATH: &str = "/run/simadmin/volte-status.json";
 
@@ -33,6 +36,18 @@ pub struct RuntimeStatus {
 pub fn read_runtime_status() -> Option<RuntimeStatus> {
     let contents = fs::read_to_string(RUNTIME_STATUS_PATH).ok()?;
     serde_json::from_str(&contents).ok()
+}
+
+pub fn write_runtime_status(status: &RuntimeStatus) -> Result<()> {
+    let path = Path::new(RUNTIME_STATUS_PATH);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid VoLTE runtime status path"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec(status)?)?;
+    fs::rename(temporary, path)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +219,90 @@ pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) ->
     }
 
     Ok(())
+}
+
+pub async fn run_secondary_ims_bearer_supervisor(config: Arc<ConfigManager>) {
+    let mut active: Option<(String, String)> = None;
+
+    loop {
+        let volte = config.get_config().volte;
+        if !volte.feature_enabled {
+            active = None;
+            let _ = write_runtime_status(&RuntimeStatus {
+                phase: "disabled".to_string(),
+                transport: "native_qmi".to_string(),
+                ..RuntimeStatus::default()
+            });
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
+        }
+
+        if active.is_none() {
+            let device = std::env::var("SIMADMIN_SECONDARY_QMI_DEVICE")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    fs::read_to_string("/run/simadmin/secondary-qmi-device")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                });
+            let Some(device) = device else {
+                let _ = write_runtime_status(&RuntimeStatus {
+                    phase: "waiting_for_secondary_qmi".to_string(),
+                    transport: "native_qmi".to_string(),
+                    last_error: "secondary QMI device is unavailable".to_string(),
+                    ..RuntimeStatus::default()
+                });
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            };
+
+            let _ = write_runtime_status(&RuntimeStatus {
+                phase: "starting_ims_bearer".to_string(),
+                transport: "native_qmi".to_string(),
+                interface: std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV").unwrap_or_default(),
+                ..RuntimeStatus::default()
+            });
+            match start_secondary_ims_bearer(&device, "ims").await {
+                Ok((handle, _settings)) => {
+                    active = Some((device, handle));
+                    let _ = write_runtime_status(&RuntimeStatus {
+                        phase: "bearer_connected".to_string(),
+                        transport: "native_qmi".to_string(),
+                        interface: std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
+                            .unwrap_or_default(),
+                        ..RuntimeStatus::default()
+                    });
+                }
+                Err(error) => {
+                    let _ = write_runtime_status(&RuntimeStatus {
+                        phase: "bearer_failed".to_string(),
+                        transport: "native_qmi".to_string(),
+                        last_error: error.to_string(),
+                        ..RuntimeStatus::default()
+                    });
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+            continue;
+        }
+
+        let (device, handle) = active.as_ref().expect("active bearer exists");
+        match secondary_ims_bearer_connected(device).await {
+            Ok(true) => {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+            Ok(false) | Err(_) => {
+                let _ = stop_secondary_ims_bearer(device, handle).await;
+                active = None;
+                let _ = write_runtime_status(&RuntimeStatus {
+                    phase: "bearer_disconnected".to_string(),
+                    transport: "native_qmi".to_string(),
+                    ..RuntimeStatus::default()
+                });
+            }
+        }
+    }
 }
 
 #[cfg(test)]
