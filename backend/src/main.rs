@@ -45,6 +45,7 @@ mod sms_listener;
 mod state;
 mod system_event;
 mod system_event_monitor;
+mod secondary_qmi;
 mod utils;
 mod verification_code;
 mod volte;
@@ -257,6 +258,8 @@ enum CliCommand {
         /// 解压目标目录
         target: String,
     },
+    /// 在 ModemManager 启动前初始化并持有 DATA6 secondary QMI 端点
+    SecondaryQmiInit,
 }
 
 #[derive(Subcommand, Debug)]
@@ -302,6 +305,9 @@ async fn main() -> Result<()> {
             AuthCommand::ResetPassword => auth::reset_admin_password_interactive(&db, &security),
             AuthCommand::Clear => auth::clear_admin_auth(&db),
         };
+    }
+    if matches!(&cli.command, Some(CliCommand::SecondaryQmiInit)) {
+        return secondary_qmi::initialize_and_hold();
     }
 
     let args = match cli.command {
