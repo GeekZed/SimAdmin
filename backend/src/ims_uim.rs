@@ -28,6 +28,23 @@ fn decode_hex(input: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+pub fn build_csim_command(apdu_hex: &str) -> Result<String> {
+    let bytes = decode_hex(apdu_hex)?;
+    if bytes.is_empty() {
+        return Err(anyhow!("USIM APDU must not be empty"));
+    }
+    Ok(format!("AT+CSIM={},\"{}\"", apdu_hex.len(), apdu_hex))
+}
+
+pub fn extract_csim_hex(response: &str) -> Result<String> {
+    let value = response
+        .split('"')
+        .nth(1)
+        .ok_or_else(|| anyhow!("Modem response did not contain CSIM hex data"))?;
+    decode_hex(value)?;
+    Ok(value.to_string())
+}
+
 pub fn parse_aid_from_select_response(response_hex: &str) -> Result<Vec<u8>> {
     let bytes = decode_hex(response_hex)?;
     for index in 0..bytes.len().saturating_sub(1) {
@@ -88,6 +105,22 @@ mod tests {
         assert_eq!(
             parse_aid_from_select_response("62098407A0000000871002").unwrap(),
             vec![0xA0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02]
+        );
+    }
+
+    #[test]
+    fn builds_csim_command() {
+        assert_eq!(
+            build_csim_command("00A4040007A0000000871002").unwrap(),
+            "AT+CSIM=24,\"00A4040007A0000000871002\""
+        );
+    }
+
+    #[test]
+    fn extracts_csim_response_hex() {
+        assert_eq!(
+            extract_csim_hex(r#"+CSIM: 144,0,"62098407A0000000871002""#).unwrap(),
+            "62098407A0000000871002"
         );
     }
 

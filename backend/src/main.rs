@@ -432,8 +432,9 @@ async fn main() -> Result<()> {
     // beta9 native IMS bearer supervisor; disabled by default in config.
     {
         let config_clone = Arc::clone(&config_manager);
+        let conn_clone = Arc::clone(&dbus_conn);
         tokio::spawn(async move {
-            volte::run_secondary_ims_bearer_supervisor(config_clone).await;
+            volte::run_secondary_ims_bearer_supervisor(config_clone, conn_clone).await;
         });
     }
 

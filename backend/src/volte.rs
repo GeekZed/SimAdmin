@@ -14,6 +14,7 @@ use tokio::process::Command;
 
 use anyhow::{anyhow, Result};
 use crate::config::ConfigManager;
+use zbus::Connection;
 
 pub const RUNTIME_STATUS_PATH: &str = "/run/simadmin/volte-status.json";
 
@@ -221,7 +222,10 @@ pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) ->
     Ok(())
 }
 
-pub async fn run_secondary_ims_bearer_supervisor(config: Arc<ConfigManager>) {
+pub async fn run_secondary_ims_bearer_supervisor(
+    config: Arc<ConfigManager>,
+    conn: Arc<Connection>,
+) {
     let mut active: Option<(String, String)> = None;
 
     loop {
@@ -266,6 +270,68 @@ pub async fn run_secondary_ims_bearer_supervisor(config: Arc<ConfigManager>) {
             match start_secondary_ims_bearer(&device, "ims").await {
                 Ok((handle, _settings)) => {
                     active = Some((device, handle));
+                    let _ = write_runtime_status(&RuntimeStatus {
+                        phase: "usim_aid_selecting".to_string(),
+                        transport: "native_qmi".to_string(),
+                        ..RuntimeStatus::default()
+                    });
+                    match crate::modem_manager::find_modem_path(&conn).await {
+                        Ok(modem_path) => {
+                            let command = match crate::ims_uim::build_csim_command(
+                                "00A4040007A0000000871002",
+                            ) {
+                                Ok(command) => command,
+                                Err(error) => {
+                                    let _ = write_runtime_status(&RuntimeStatus {
+                                        phase: "usim_aid_failed".to_string(),
+                                        transport: "native_qmi".to_string(),
+                                        last_error: error.to_string(),
+                                        ..RuntimeStatus::default()
+                                    });
+                                    continue;
+                                }
+                            };
+                            match crate::modem_manager::send_at_command(
+                                &conn,
+                                &modem_path,
+                                &command,
+                            )
+                            .await
+                            {
+                                Ok(response) => match crate::ims_uim::extract_csim_hex(&response)
+                                    .and_then(|hex| {
+                                        crate::ims_uim::parse_aid_from_select_response(&hex)
+                                            .map(|_| ())
+                                    }) {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        let _ = write_runtime_status(&RuntimeStatus {
+                                            phase: "usim_aid_failed".to_string(),
+                                            transport: "native_qmi".to_string(),
+                                            last_error: error.to_string(),
+                                            ..RuntimeStatus::default()
+                                        });
+                                    }
+                                },
+                                Err(error) => {
+                                    let _ = write_runtime_status(&RuntimeStatus {
+                                        phase: "usim_aid_failed".to_string(),
+                                        transport: "native_qmi".to_string(),
+                                        last_error: error,
+                                        ..RuntimeStatus::default()
+                                    });
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = write_runtime_status(&RuntimeStatus {
+                                phase: "usim_aid_failed".to_string(),
+                                transport: "native_qmi".to_string(),
+                                last_error: error.to_string(),
+                                ..RuntimeStatus::default()
+                            });
+                        }
+                    }
                     let _ = write_runtime_status(&RuntimeStatus {
                         phase: "bearer_connected".to_string(),
                         transport: "native_qmi".to_string(),

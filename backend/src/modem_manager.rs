@@ -1710,6 +1710,15 @@ async fn send_at_via_modem_command(
     }
 }
 
+/// Public native-IMS wrapper around ModemManager's serialized AT command path.
+pub async fn send_at_command(
+    conn: &Connection,
+    modem_path: &str,
+    command: &str,
+) -> Result<String, String> {
+    send_at_via_modem_command(conn, modem_path, command).await
+}
+
 /// 后台异步获取 SMSC 并写入缓存。
 /// 优先使用 AT+CRSM 读 EF_SMSP（可靠且快速）。
 /// 需要 ModemManager 以 --debug 模式运行以支持 Modem.Command 接口。
