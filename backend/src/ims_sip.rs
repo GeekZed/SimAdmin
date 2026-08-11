@@ -33,6 +33,22 @@ pub fn parse_pcscf_address(output: &str) -> Option<Ipv6Addr> {
     })
 }
 
+pub fn parse_pcscf_from_cgcontrdp(output: &str) -> Option<Ipv6Addr> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        if !line.to_ascii_uppercase().starts_with("+CGCONTRDP:") {
+            return None;
+        }
+        line.split_once(':')?
+            .1
+            .split(',')
+            .skip(8)
+            .take(2)
+            .map(|value| value.trim().trim_matches(['\'', '"', '[', ']']))
+            .find_map(|value| value.parse().ok())
+    })
+}
+
 fn md5_hex(value: &str) -> String {
     let digest = md5::compute(value.as_bytes());
     format!("{digest:x}")
@@ -192,6 +208,15 @@ mod tests {
     fn parses_pcscf_ipv6() {
         assert_eq!(
             parse_pcscf_address("P-CSCF address: '[2001:db8::5]'"),
+            Some("2001:db8::5".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parses_pcscf_from_cgcontrdp() {
+        let response = "+CGCONTRDP: 4,5,\"ims\",\"2001:db8::10\",\"::\",\"2001:db8::1\",\"::\",\"::\",\"2001:db8::5\",\"::\"";
+        assert_eq!(
+            parse_pcscf_from_cgcontrdp(response),
             Some("2001:db8::5".parse().unwrap())
         );
     }
