@@ -14,6 +14,8 @@ use tokio::process::Command;
 
 use anyhow::{anyhow, Result};
 use crate::config::ConfigManager;
+use crate::db::Database;
+use crate::notification::NotificationSender;
 use zbus::Connection;
 
 pub const RUNTIME_STATUS_PATH: &str = "/run/simadmin/volte-status.json";
@@ -337,6 +339,8 @@ pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) ->
 pub async fn run_secondary_ims_bearer_supervisor(
     config: Arc<ConfigManager>,
     conn: Arc<Connection>,
+    database: Arc<Database>,
+    notifications: Arc<NotificationSender>,
 ) {
     let mut active: Option<(String, String)> = None;
 
@@ -480,6 +484,23 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         match register_native_ims(&conn, &settings, pcscf).await {
                             Ok(()) => {
                                 registration_succeeded = true;
+                                let sms_local = settings.ipv6_address.parse().ok();
+                                if let Some(sms_local) = sms_local {
+                                    let database_clone = Arc::clone(&database);
+                                    let notifications_clone = Arc::clone(&notifications);
+                                    tokio::spawn(async move {
+                                        if let Err(error) = crate::ims_sms::run_ims_sms_listener(
+                                            sms_local,
+                                            5062,
+                                            database_clone,
+                                            notifications_clone,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(error = %error, "IMS SMS listener stopped");
+                                        }
+                                    });
+                                }
                                 let _ = write_runtime_status(&RuntimeStatus {
                                     phase: "registered".to_string(),
                                     registered: true,

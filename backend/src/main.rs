@@ -434,8 +434,16 @@ async fn main() -> Result<()> {
     {
         let config_clone = Arc::clone(&config_manager);
         let conn_clone = Arc::clone(&dbus_conn);
+        let database_clone = Arc::clone(&app_db);
+        let notifications_clone = Arc::clone(&notification_sender);
         tokio::spawn(async move {
-            volte::run_secondary_ims_bearer_supervisor(config_clone, conn_clone).await;
+            volte::run_secondary_ims_bearer_supervisor(
+                config_clone,
+                conn_clone,
+                database_clone,
+                notifications_clone,
+            )
+            .await;
         });
     }
 

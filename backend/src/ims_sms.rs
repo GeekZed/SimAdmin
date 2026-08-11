@@ -2,6 +2,11 @@
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+
+use crate::db::{beijing_sms_now_string, Database, SmsMessage};
+use crate::notification::NotificationSender;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IncomingImsSms {
@@ -146,6 +151,88 @@ pub fn decode_ims_sms(body_hex: &str) -> Result<IncomingImsSms> {
     })
 }
 
+pub fn decode_ims_sms_body(body: &[u8]) -> Result<IncomingImsSms> {
+    let body_hex: String = if body.iter().all(|byte| byte.is_ascii_hexdigit() || byte.is_ascii_whitespace()) {
+        String::from_utf8(body.to_vec())?
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect()
+    } else {
+        body.iter().map(|byte| format!("{byte:02X}")).collect()
+    };
+    decode_ims_sms(&body_hex)
+}
+
+fn sip_ok_response(headers: &HashMap<String, String>) -> String {
+    let mut response = String::from("SIP/2.0 200 OK\r\n");
+    for name in ["via", "from", "to", "call-id", "cseq"] {
+        if let Some(value) = headers.get(name) {
+            response.push_str(name);
+            response.push_str(": ");
+            response.push_str(value);
+            response.push_str("\r\n");
+        }
+    }
+    response.push_str("Content-Length: 0\r\n\r\n");
+    response
+}
+
+pub async fn run_ims_sms_listener(
+    local: std::net::Ipv6Addr,
+    port: u16,
+    database: Arc<Database>,
+    notifications: Arc<NotificationSender>,
+) -> Result<()> {
+    let socket = UdpSocket::bind((local, port)).await?;
+    let mut buffer = vec![0u8; 8192];
+    loop {
+        let (length, peer) = socket.recv_from(&mut buffer).await?;
+        let packet = &buffer[..length];
+        let Ok((headers, body)) = parse_sip_message(packet) else {
+            continue;
+        };
+        let is_message = packet
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .and_then(|end| std::str::from_utf8(&packet[..end]).ok())
+            .is_some_and(|line| line.starts_with("MESSAGE "));
+        let content_type = headers
+            .get("content-type")
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !is_message || !content_type.contains("application/vnd.3gpp.sms") {
+            continue;
+        }
+        let response = sip_ok_response(&headers);
+        let _ = socket.send_to(response.as_bytes(), peer).await;
+        let Ok(incoming) = decode_ims_sms_body(&body) else {
+            continue;
+        };
+        if database.sms_exists_by_pdu(&incoming.marker)? {
+            continue;
+        }
+        let timestamp = beijing_sms_now_string();
+        let id = database.insert_sms_at(
+            "incoming",
+            &incoming.phone_number,
+            &incoming.content,
+            &timestamp,
+            "received",
+            Some(&incoming.marker),
+        )?;
+        let message = SmsMessage {
+            id,
+            direction: "incoming".to_string(),
+            phone_number: incoming.phone_number,
+            content: incoming.content,
+            timestamp,
+            status: "received".to_string(),
+            pdu: Some(incoming.marker),
+        };
+        let _ = notifications.forward_sms(&message).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +253,11 @@ mod tests {
         let (headers, body) = parse_sip_message(packet).unwrap();
         assert_eq!(headers.get("content-type").unwrap(), "application/vnd.3gpp.sms");
         assert_eq!(body, b"AABB");
+    }
+
+    #[test]
+    fn accepts_binary_sms_body() {
+        let body = [0x00, 0x00, 0x00, 0x00, 0x01, 0x04];
+        assert!(decode_ims_sms_body(&body).is_err());
     }
 }
