@@ -194,7 +194,6 @@ pub async fn start_secondary_ims_bearer(
             .args([
                 "-d",
                 qmi_device,
-                "--device-open-proxy",
                 "--device-open-qmi",
                 "--device-open-net=net-raw-ip|net-no-qos-header",
                 "--wds-set-ip-family=6",
@@ -209,7 +208,7 @@ pub async fn start_secondary_ims_bearer(
             String::from_utf8_lossy(&family_output.stderr).trim()
         ));
     }
-    let start_arg = format!("--wds-start-network=apn={apn},ip-type=6");
+    let start_arg = format!("--wds-start-network=apn={apn},3gpp-profile=1,ip-type=6");
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("qmicli")
@@ -217,7 +216,6 @@ pub async fn start_secondary_ims_bearer(
             .args([
                 "-d",
                 qmi_device,
-                "--device-open-proxy",
                 "--device-open-qmi",
                 "--device-open-net=net-raw-ip|net-no-qos-header",
                 "--client-no-release-cid",
@@ -258,7 +256,6 @@ pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBeare
             .args([
                 "-d",
                 qmi_device,
-                "--device-open-proxy",
                 "--device-open-qmi",
                 "--device-open-net=net-raw-ip|net-no-qos-header",
                 "--wds-get-current-settings",
@@ -403,7 +400,6 @@ pub async fn secondary_ims_bearer_connected(qmi_device: &str) -> Result<bool> {
             .args([
                 "-d",
                 qmi_device,
-                "--device-open-proxy",
                 "--device-open-qmi",
                 "--wds-get-packet-service-status",
             ])
@@ -436,7 +432,6 @@ pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) ->
             .args([
                 "-d",
                 qmi_device,
-                "--device-open-proxy",
                 "--device-open-qmi",
                 "--device-open-net=net-raw-ip|net-no-qos-header",
                 &stop_arg,
@@ -527,7 +522,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                 Ok(command) => command,
                                 Err(error) => {
                                     let _ = write_runtime_status(&RuntimeStatus {
-                                        phase: "usim_aid_failed".to_string(),
+                                        phase: "degraded".to_string(),
                                         transport: "native_qmi".to_string(),
                                         last_error: error.to_string(),
                                         ..RuntimeStatus::default()
@@ -550,7 +545,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                     Ok(()) => {}
                                     Err(error) => {
                                         let _ = write_runtime_status(&RuntimeStatus {
-                                            phase: "usim_aid_failed".to_string(),
+                                            phase: "degraded".to_string(),
                                             transport: "native_qmi".to_string(),
                                             last_error: error.to_string(),
                                             ..RuntimeStatus::default()
@@ -559,7 +554,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                 },
                                 Err(error) => {
                                     let _ = write_runtime_status(&RuntimeStatus {
-                                        phase: "usim_aid_failed".to_string(),
+                                        phase: "degraded".to_string(),
                                         transport: "native_qmi".to_string(),
                                         last_error: error,
                                         ..RuntimeStatus::default()
@@ -569,7 +564,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         }
                         Err(error) => {
                             let _ = write_runtime_status(&RuntimeStatus {
-                                phase: "usim_aid_failed".to_string(),
+                                phase: "degraded".to_string(),
                                 transport: "native_qmi".to_string(),
                                 last_error: error.to_string(),
                                 ..RuntimeStatus::default()
@@ -615,7 +610,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         .await
                         {
                             let _ = write_runtime_status(&RuntimeStatus {
-                                phase: "ims_interface_failed".to_string(),
+                                phase: "degraded".to_string(),
                                 transport: "native_qmi".to_string(),
                                 interface: netdev.clone(),
                                 last_error: error.to_string(),
@@ -655,7 +650,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                             }
                             Err(error) => {
                                 let _ = write_runtime_status(&RuntimeStatus {
-                                    phase: "register_failed".to_string(),
+                                    phase: "degraded".to_string(),
                                     transport: "native_qmi_ipsec".to_string(),
                                     last_error: error.to_string(),
                                     ..RuntimeStatus::default()
@@ -672,7 +667,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                             let _ = stop_secondary_ims_bearer(&active_device, &active_handle).await;
                         }
                         let _ = write_runtime_status(&RuntimeStatus {
-                            phase: "bearer_connected".to_string(),
+                            phase: "degraded".to_string(),
                             transport: "native_qmi".to_string(),
                             interface: netdev.clone(),
                             ..RuntimeStatus::default()
@@ -681,7 +676,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                 }
                 Err(error) => {
                     let _ = write_runtime_status(&RuntimeStatus {
-                        phase: "bearer_failed".to_string(),
+                        phase: "degraded".to_string(),
                         transport: "native_qmi".to_string(),
                         last_error: error.to_string(),
                         ..RuntimeStatus::default()
@@ -704,7 +699,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                 let _ = stop_secondary_ims_bearer(device, handle).await;
                 active = None;
                 let _ = write_runtime_status(&RuntimeStatus {
-                    phase: "bearer_disconnected".to_string(),
+                    phase: "degraded".to_string(),
                     transport: "native_qmi".to_string(),
                     ..RuntimeStatus::default()
                 });

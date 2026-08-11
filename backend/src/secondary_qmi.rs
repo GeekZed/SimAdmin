@@ -78,7 +78,6 @@ fn qmi_device_ready(device: &str) -> bool {
         .args([
             "-d",
             device,
-            "--device-open-proxy",
             "--device-open-qmi",
             "--device-open-net=net-raw-ip|net-no-qos-header",
             "--get-service-version-info",
