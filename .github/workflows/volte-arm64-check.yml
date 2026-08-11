@@ -33,3 +33,10 @@ jobs:
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --locked --release --target aarch64-unknown-linux-musl
+
+      - name: Upload ARM64 backend
+        uses: actions/upload-artifact@v4
+        with:
+          name: simadmin-volte-aarch64
+          path: backend/target/aarch64-unknown-linux-musl/release/simadmin
+          if-no-files-found: error
