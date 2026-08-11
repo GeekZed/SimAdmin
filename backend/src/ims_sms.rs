@@ -163,6 +163,22 @@ pub fn decode_ims_sms_body(body: &[u8]) -> Result<IncomingImsSms> {
     decode_ims_sms(&body_hex)
 }
 
+pub fn build_rp_ack(body: &[u8]) -> Result<Vec<u8>> {
+    let body_hex: String = if body.iter().all(|byte| byte.is_ascii_hexdigit() || byte.is_ascii_whitespace()) {
+        String::from_utf8(body.to_vec())?
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect()
+    } else {
+        body.iter().map(|byte| format!("{byte:02X}")).collect()
+    };
+    let rp_data = decode_hex(&body_hex)?;
+    if rp_data.len() < 2 || rp_data[0] != 0x00 {
+        return Err(anyhow!("cannot acknowledge non-RP-DATA body"));
+    }
+    Ok(vec![0x02, rp_data[1]])
+}
+
 fn sip_ok_response(headers: &HashMap<String, String>) -> String {
     let mut response = String::from("SIP/2.0 200 OK\r\n");
     for name in ["via", "from", "to", "call-id", "cseq"] {
@@ -205,6 +221,10 @@ pub async fn run_ims_sms_listener(
         }
         let response = sip_ok_response(&headers);
         let _ = socket.send_to(response.as_bytes(), peer).await;
+        if let Ok(ack) = build_rp_ack(&body) {
+            let ack_hex: String = ack.iter().map(|byte| format!("{byte:02X}")).collect();
+            tracing::debug!(rp_ack = %ack_hex, "IMS SMS RP-ACK prepared");
+        }
         let Ok(incoming) = decode_ims_sms_body(&body) else {
             continue;
         };
@@ -259,5 +279,10 @@ mod tests {
     fn accepts_binary_sms_body() {
         let body = [0x00, 0x00, 0x00, 0x00, 0x01, 0x04];
         assert!(decode_ims_sms_body(&body).is_err());
+    }
+
+    #[test]
+    fn builds_matching_rp_ack() {
+        assert_eq!(build_rp_ack(&[0x00, 0x37, 0x00, 0x00]).unwrap(), vec![0x02, 0x37]);
     }
 }
