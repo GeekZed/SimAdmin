@@ -12,6 +12,8 @@ RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}}"
 SERVICE_URL="${SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin.service}"
 MODEM_RECOVERY_SCRIPT_URL="${MODEM_RECOVERY_SCRIPT_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.sh}"
 MODEM_RECOVERY_SERVICE_URL="${MODEM_RECOVERY_SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.service}"
+SECONDARY_QMI_SERVICE_URL="${SECONDARY_QMI_SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin-secondary-qmi.service}"
+SECONDARY_QMI_RULE_URL="${SECONDARY_QMI_RULE_URL:-${RAW_BASE}/main/scripts/99-simadmin-secondary-qmi.rules}"
 ASSET_URL="${ASSET_URL:-}"
 WFC="${WFC:-0}"
 VARIANT="${VARIANT:-}"
@@ -438,6 +440,18 @@ install_modem_recovery_service() {
   download_with_proxies "$MODEM_RECOVERY_SERVICE_URL" "$service_dst"
   systemctl daemon-reload
   systemctl enable simadmin-modem-recovery.service >/dev/null
+}
+
+install_secondary_qmi_service() {
+  service_dst="/etc/systemd/system/simadmin-secondary-qmi.service"
+  rule_dst="/etc/udev/rules.d/99-simadmin-secondary-qmi.rules"
+
+  mkdir -p /etc/systemd/system /etc/udev/rules.d
+  download_with_proxies "$SECONDARY_QMI_SERVICE_URL" "$service_dst"
+  download_with_proxies "$SECONDARY_QMI_RULE_URL" "$rule_dst"
+  udevadm control --reload-rules >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl enable simadmin-secondary-qmi.service >/dev/null
 }
 
 normalize_lpac_arch() {
@@ -1193,6 +1207,8 @@ EOF
   install_service_file
   echo "==> installing modem recovery service"
   install_modem_recovery_service
+  echo "==> installing secondary QMI initializer"
+  install_secondary_qmi_service
 
   echo "==> starting service"
   systemctl restart "${SERVICE_NAME}.service"

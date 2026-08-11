@@ -239,6 +239,8 @@ main() {
 
   remove_systemd_unit "${SERVICE_NAME}.service"
   remove_systemd_unit "${MODEM_RECOVERY_SERVICE_NAME}.service"
+  remove_systemd_unit "simadmin-secondary-qmi.service"
+  remove_path "/etc/udev/rules.d/99-simadmin-secondary-qmi.rules"
   cleanup_systemd
 
   remove_path "$MODEM_RECOVERY_SCRIPT"
