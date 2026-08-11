@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -2336,8 +2337,13 @@ async fn at_command_device(conn: &Connection) -> Result<String, String> {
     let ports = Vec::<(String, u32)>::try_from(value).unwrap_or_default();
     ports
         .iter()
+        .filter(|(port, _)| Path::new(&modem_device_path(port)).exists())
         .find(|(_, port_type)| *port_type == MM_MODEM_PORT_TYPE_AT)
-        .or_else(|| ports.iter().find(|(port, _)| looks_like_at_port(port)))
+        .or_else(|| {
+            ports.iter().find(|(port, _)| {
+                Path::new(&modem_device_path(port)).exists() && looks_like_at_port(port)
+            })
+        })
         .map(|(port, _)| modem_device_path(port))
         .ok_or_else(|| "未找到 AT 端口（例如 /dev/wwan0at0）".to_string())
 }
