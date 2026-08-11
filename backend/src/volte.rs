@@ -122,11 +122,13 @@ pub async fn start_secondary_ims_bearer(
     let family_output = tokio::time::timeout(
         Duration::from_secs(15),
         Command::new("qmicli")
+            .kill_on_drop(true)
             .args([
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
                 "--device-open-qmi",
+                "--device-open-net=net-raw-ip|net-no-qos-header",
                 "--wds-set-ip-family=6",
             ])
             .output(),
@@ -139,15 +141,18 @@ pub async fn start_secondary_ims_bearer(
             String::from_utf8_lossy(&family_output.stderr).trim()
         ));
     }
-    let start_arg = format!("--wds-start-network=apn={apn},3gpp-profile=");
+    let start_arg = format!("--wds-start-network=apn={apn},ip-type=6");
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("qmicli")
+            .kill_on_drop(true)
             .args([
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
                 "--device-open-qmi",
+                "--device-open-net=net-raw-ip|net-no-qos-header",
+                "--client-no-release-cid",
                 &start_arg,
             ])
             .output(),
@@ -173,11 +178,13 @@ pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBeare
     let output = tokio::time::timeout(
         Duration::from_secs(15),
         Command::new("qmicli")
+            .kill_on_drop(true)
             .args([
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
                 "--device-open-qmi",
+                "--device-open-net=net-raw-ip|net-no-qos-header",
                 "--wds-get-current-settings",
             ])
             .output(),
@@ -316,6 +323,7 @@ pub async fn secondary_ims_bearer_connected(qmi_device: &str) -> Result<bool> {
     let output = tokio::time::timeout(
         Duration::from_secs(15),
         Command::new("qmicli")
+            .kill_on_drop(true)
             .args([
                 "-d",
                 qmi_device,
@@ -348,11 +356,13 @@ pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) ->
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("qmicli")
+            .kill_on_drop(true)
             .args([
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
                 "--device-open-qmi",
+                "--device-open-net=net-raw-ip|net-no-qos-header",
                 &stop_arg,
             ])
             .output(),
