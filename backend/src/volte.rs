@@ -187,27 +187,6 @@ pub async fn start_secondary_ims_bearer(
         return Err(anyhow!("QMI device and IMS APN are required"));
     }
 
-    let family_output = tokio::time::timeout(
-        Duration::from_secs(15),
-        Command::new("qmicli")
-            .kill_on_drop(true)
-            .args([
-                "-d",
-                qmi_device,
-                "--device-open-qmi",
-                "--device-open-net=net-raw-ip|net-no-qos-header",
-                "--wds-set-ip-family=6",
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| anyhow!("timed out setting secondary IMS IPv6 family"))??;
-    if !family_output.status.success() {
-        return Err(anyhow!(
-            "qmicli failed to set secondary IMS IPv6 family: {}",
-            String::from_utf8_lossy(&family_output.stderr).trim()
-        ));
-    }
     let start_arg = format!("--wds-start-network=apn={apn},3gpp-profile=1,ip-type=6");
     let output = tokio::time::timeout(
         Duration::from_secs(30),
