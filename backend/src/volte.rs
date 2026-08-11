@@ -7,6 +7,10 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::time::Duration;
+use tokio::process::Command;
+
+use anyhow::{anyhow, Result};
 
 pub const RUNTIME_STATUS_PATH: &str = "/run/simadmin/volte-status.json";
 
@@ -31,6 +35,112 @@ pub fn read_runtime_status() -> Option<RuntimeStatus> {
     serde_json::from_str(&contents).ok()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QmiBearerSettings {
+    pub ipv6_address: String,
+    pub ipv6_gateway: String,
+    pub mtu: Option<u32>,
+}
+
+/// Parse the stable fields emitted by `qmicli --wds-get-current-settings`.
+/// The parser intentionally ignores localized labels and fields that are not
+/// needed by the IMS path; callers must still validate that both IPv6 values
+/// are present before installing routes or XFRM policies.
+pub fn parse_qmi_bearer_settings(output: &str) -> Option<QmiBearerSettings> {
+    let value = |label: &str| {
+        output
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(label))
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+
+    let ipv6_address = value("IPv6 address:")?;
+    let ipv6_gateway = value("IPv6 gateway address:")?;
+    let mtu = value("MTU:").and_then(|value| value.parse().ok());
+    Some(QmiBearerSettings {
+        ipv6_address,
+        ipv6_gateway,
+        mtu,
+    })
+}
+
+pub fn parse_qmi_packet_handle(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (label, value) = line.split_once(':')?;
+        if label.trim() == "Packet data handle" {
+            let value = value.trim().trim_matches('\'');
+            (!value.is_empty()).then(|| value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+pub async fn start_secondary_ims_bearer(
+    qmi_device: &str,
+    apn: &str,
+) -> Result<(String, QmiBearerSettings)> {
+    if qmi_device.trim().is_empty() || apn.trim().is_empty() {
+        return Err(anyhow!("QMI device and IMS APN are required"));
+    }
+
+    let start_arg = format!("--wds-start-network=apn={apn},ip-type=6");
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        Command::new("qmicli")
+            .args([
+                "-d",
+                qmi_device,
+                "--device-open-proxy",
+                &start_arg,
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out starting secondary IMS bearer"))??;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "qmicli failed to start secondary IMS bearer: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let handle = parse_qmi_packet_handle(&stdout)
+        .ok_or_else(|| anyhow!("qmicli did not return a packet data handle"))?;
+    let settings = read_secondary_bearer_settings(qmi_device).await?;
+    Ok((handle, settings))
+}
+
+pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBearerSettings> {
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        Command::new("qmicli")
+            .args([
+                "-d",
+                qmi_device,
+                "--device-open-proxy",
+                "--wds-get-current-settings",
+            ])
+            .output(),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out reading secondary IMS bearer settings"))??;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "qmicli failed to read secondary IMS bearer settings: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    parse_qmi_bearer_settings(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| anyhow!("secondary IMS bearer did not provide IPv6 settings"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::RuntimeStatus;
@@ -41,5 +151,26 @@ mod tests {
         assert!(status.registered);
         assert!(!status.sms_ready);
         assert!(status.transport.is_empty());
+    }
+
+    #[test]
+    fn parses_qmi_ipv6_settings() {
+        let output = "IPv6 address: 2001:db8::10\nIPv6 gateway address: 2001:db8::1\nMTU: 1432";
+        assert_eq!(
+            super::parse_qmi_bearer_settings(output),
+            Some(super::QmiBearerSettings {
+                ipv6_address: "2001:db8::10".to_string(),
+                ipv6_gateway: "2001:db8::1".to_string(),
+                mtu: Some(1432),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_qmi_packet_handle() {
+        assert_eq!(
+            super::parse_qmi_packet_handle("Packet data handle: '42'"),
+            Some("42".to_string())
+        );
     }
 }
