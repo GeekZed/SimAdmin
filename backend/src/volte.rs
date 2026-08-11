@@ -216,10 +216,29 @@ pub async fn start_secondary_ims_bearer(
     let handle = parse_qmi_packet_handle(&stdout)
         .ok_or_else(|| anyhow!("qmicli did not return a packet data handle"))?;
     let mut last_error = None;
-    for _ in 0..5 {
+    for attempt in 0..5 {
         match read_secondary_bearer_settings(qmi_device).await {
             Ok(settings) => return Ok((handle, settings)),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt == 0 {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        Command::new("qmicli")
+                            .kill_on_drop(true)
+                            .args([
+                                "-d",
+                                qmi_device,
+                                "--device-open-qmi",
+                                "--device-open-net=net-raw-ip|net-no-qos-header",
+                                "--client-no-release-cid",
+                                &start_arg,
+                            ])
+                            .output(),
+                    )
+                    .await;
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
