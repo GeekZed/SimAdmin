@@ -35,7 +35,7 @@ impl EspSecurityAssociation {
         vec![
             "xfrm".into(),
             "state".into(),
-            "replace".into(),
+            "add".into(),
             "src".into(),
             self.local.to_string(),
             "dst".into(),
@@ -62,11 +62,24 @@ fn is_hex(value: &str) -> bool {
 
 pub async fn install_esp_state(sa: &EspSecurityAssociation) -> Result<()> {
     sa.validate()?;
-    let output = Command::new("ip")
-        .args(sa.args())
+    let mut args = sa.args();
+    let mut output = Command::new("ip")
+        .args(&args)
         .stdin(Stdio::null())
         .output()
         .await?;
+    if !output.status.success()
+        && String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("file exists")
+    {
+        args[2] = "update".into();
+        output = Command::new("ip")
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+    }
     if !output.status.success() {
         return Err(anyhow!(
             "failed to install IMS IPsec state: {}",
@@ -84,37 +97,46 @@ async fn install_policy(
     source_port: u16,
     destination_port: u16,
 ) -> Result<()> {
-    let output = Command::new("ip")
-        .args([
-            "xfrm",
-            "policy",
-            "replace",
-            "dir",
-            direction,
-            "src",
-            &format!("{local}/128"),
-            "dst",
-            &format!("{remote}/128"),
-            "proto",
-            "udp",
-            "sport",
-            &source_port.to_string(),
-            "dport",
-            &destination_port.to_string(),
-            "tmpl",
-            "src",
-            &local.to_string(),
-            "dst",
-            &remote.to_string(),
-            "proto",
-            "esp",
-            "spi",
-            &format!("0x{spi:08x}"),
-            "mode",
-            "transport",
-        ])
+    let mut args = vec![
+        "xfrm".to_string(),
+        "policy".to_string(),
+        "add".to_string(),
+        "dir".to_string(),
+        direction.to_string(),
+        "src".to_string(),
+        format!("{local}/128"),
+        "dst".to_string(),
+        format!("{remote}/128"),
+        "proto".to_string(),
+        "udp".to_string(),
+        "sport".to_string(),
+        source_port.to_string(),
+        "dport".to_string(),
+        destination_port.to_string(),
+        "tmpl".to_string(),
+        "src".to_string(),
+        local.to_string(),
+        "dst".to_string(),
+        remote.to_string(),
+        "proto".to_string(),
+        "esp".to_string(),
+        "spi".to_string(),
+        format!("0x{spi:08x}"),
+        "mode".to_string(),
+        "transport".to_string(),
+    ];
+    let mut output = Command::new("ip")
+        .args(&args)
         .output()
         .await?;
+    if !output.status.success()
+        && String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("file exists")
+    {
+        args[2] = "update".to_string();
+        output = Command::new("ip").args(&args).output().await?;
+    }
     if !output.status.success() {
         return Err(anyhow!(
             "failed to install IMS IPsec {direction} policy: {}",
@@ -193,7 +215,7 @@ mod tests {
     #[test]
     fn builds_transport_esp_arguments() {
         let args = sample().args();
-        assert_eq!(args[2], "replace");
+        assert_eq!(args[2], "add");
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "mode" && pair[1] == "transport"));
