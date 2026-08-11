@@ -332,6 +332,28 @@ pub async fn run_secondary_ims_bearer_supervisor(
                             });
                         }
                     }
+                    if let Ok(modem_path) = crate::modem_manager::find_modem_path(&conn).await {
+                        match crate::modem_manager::send_at_command(
+                            &conn,
+                            &modem_path,
+                            "AT+CGCONTRDP",
+                        )
+                        .await
+                        {
+                            Ok(response) => {
+                                if let Some(pcscf) = crate::ims_sip::parse_pcscf_from_cgcontrdp(&response)
+                                {
+                                    tracing::info!(pcscf = %pcscf, "IMS P-CSCF discovered");
+                                    let _ = write_runtime_status(&RuntimeStatus {
+                                        phase: "pcscf_discovered".to_string(),
+                                        transport: "native_qmi".to_string(),
+                                        ..RuntimeStatus::default()
+                                    });
+                                }
+                            }
+                            Err(error) => tracing::debug!(error = %error, "IMS P-CSCF AT query failed"),
+                        }
+                    }
                     let _ = write_runtime_status(&RuntimeStatus {
                         phase: "bearer_connected".to_string(),
                         transport: "native_qmi".to_string(),
