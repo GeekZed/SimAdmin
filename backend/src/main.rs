@@ -34,6 +34,7 @@ mod device_network;
 mod device_status;
 mod esim;
 mod handlers;
+mod ims_ipsec;
 mod iptables;
 mod models;
 mod modem_manager;
