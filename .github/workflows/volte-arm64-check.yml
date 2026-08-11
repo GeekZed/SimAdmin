@@ -36,7 +36,7 @@ jobs:
 
       - name: Build beta9-compatible UIM helper
         run: |
-          gcc -O2 -o simadmin-uim-apdu scripts/simadmin-uim-apdu.c $(pkg-config --cflags --libs libqmi-glib)
+          gcc -O2 -o simadmin-uim-apdu scripts/simadmin-uim-apdu.c $(pkg-config --cflags --libs qmi-glib-1.0)
 
       - name: Upload ARM64 backend
         uses: actions/upload-artifact@v4
