@@ -81,6 +81,8 @@ async fn install_policy(
     local: Ipv6Addr,
     remote: Ipv6Addr,
     spi: u32,
+    source_port: u16,
+    destination_port: u16,
 ) -> Result<()> {
     let output = Command::new("ip")
         .args([
@@ -93,6 +95,12 @@ async fn install_policy(
             &format!("{local}/128"),
             "dst",
             &format!("{remote}/128"),
+            "proto",
+            "udp",
+            "sport",
+            &source_port.to_string(),
+            "dport",
+            &destination_port.to_string(),
             "tmpl",
             "src",
             &local.to_string(),
@@ -122,6 +130,10 @@ pub async fn install_bidirectional_esp(
     client_spi: u32,
     server_spi: u32,
     ik_hex: &str,
+    local_send_port: u16,
+    local_receive_port: u16,
+    remote_client_port: u16,
+    remote_send_port: u16,
 ) -> Result<()> {
     let outbound = EspSecurityAssociation {
         local,
@@ -137,8 +149,24 @@ pub async fn install_bidirectional_esp(
     };
     install_esp_state(&outbound).await?;
     install_esp_state(&inbound).await?;
-    install_policy("out", local, remote, client_spi).await?;
-    install_policy("in", remote, local, server_spi).await?;
+    install_policy(
+        "out",
+        local,
+        remote,
+        client_spi,
+        local_send_port,
+        remote_send_port,
+    )
+    .await?;
+    install_policy(
+        "in",
+        remote,
+        local,
+        server_spi,
+        remote_client_port,
+        local_receive_port,
+    )
+    .await?;
     Ok(())
 }
 

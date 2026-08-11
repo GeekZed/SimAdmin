@@ -251,6 +251,10 @@ pub async fn register_native_ims(
         security.client_spi,
         security.server_spi,
         &ik_hex,
+        security.client_port,
+        security.client_port,
+        security.server_port,
+        security.server_port,
     )
     .await?;
     registration.realm = challenge.realm;
