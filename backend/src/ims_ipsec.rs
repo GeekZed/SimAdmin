@@ -51,7 +51,7 @@ impl EspSecurityAssociation {
             self.auth_key_hex.clone(),
             "96".into(),
             "enc".into(),
-            "cipher_null".into(),
+            "ecb(cipher_null)".into(),
         ]
     }
 }
@@ -197,5 +197,8 @@ mod tests {
             .windows(2)
             .any(|pair| pair[0] == "mode" && pair[1] == "transport"));
         assert!(args.iter().any(|value| value == "0x00001234"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "enc" && pair[1] == "ecb(cipher_null)"));
     }
 }
