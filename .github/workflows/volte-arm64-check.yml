@@ -23,7 +23,7 @@ jobs:
       - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools libqmi-dev libqrtr-glib-dev libglib2.0-dev
+          sudo apt-get install -y musl-tools libqmi-glib-dev libqrtr-glib-dev libglib2.0-dev
 
       - name: Build backend for ARM64
         working-directory: backend
