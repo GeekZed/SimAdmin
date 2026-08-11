@@ -63,7 +63,7 @@ pub fn build_aka_auth_command(nonce: &str) -> Result<String> {
     build_csim_command(&apdu)
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 

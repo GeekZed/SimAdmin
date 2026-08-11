@@ -253,7 +253,17 @@ pub async fn send_udp_request(
     remote_port: u16,
     request: &str,
 ) -> Result<String> {
-    let socket = UdpSocket::bind((local, 0)).await?;
+    send_udp_request_from_port(local, 0, remote, remote_port, request).await
+}
+
+pub async fn send_udp_request_from_port(
+    local: Ipv6Addr,
+    local_port: u16,
+    remote: Ipv6Addr,
+    remote_port: u16,
+    request: &str,
+) -> Result<String> {
+    let socket = UdpSocket::bind((local, local_port)).await?;
     socket.connect((remote, remote_port)).await?;
     socket.send(request.as_bytes()).await?;
     let mut buffer = vec![0u8; 8192];
