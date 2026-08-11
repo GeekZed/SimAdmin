@@ -75,14 +75,69 @@ pub fn parse_qmi_bearer_settings(output: &str) -> Option<QmiBearerSettings> {
             .map(str::to_string)
     };
 
-    let ipv6_address = value("IPv6 address:")?;
-    let ipv6_gateway = value("IPv6 gateway address:")?;
+    let ipv6_address = value("IPv6 address:")?.split('/').next()?.to_string();
+    let ipv6_gateway = value("IPv6 gateway address:")?.split('/').next()?.to_string();
     let mtu = value("MTU:").and_then(|value| value.parse().ok());
     Some(QmiBearerSettings {
         ipv6_address,
         ipv6_gateway,
         mtu,
     })
+}
+
+pub async fn configure_secondary_ipv6_interface(
+    netdev: &str,
+    settings: &QmiBearerSettings,
+    pcscf: std::net::Ipv6Addr,
+) -> Result<()> {
+    if netdev.trim().is_empty() {
+        return Err(anyhow!("secondary IMS network interface is unavailable"));
+    }
+    let address = settings
+        .ipv6_address
+        .parse::<std::net::Ipv6Addr>()
+        .map_err(|_| anyhow!("secondary IMS IPv6 address is invalid"))?;
+    let gateway = settings
+        .ipv6_gateway
+        .parse::<std::net::Ipv6Addr>()
+        .map_err(|_| anyhow!("secondary IMS IPv6 gateway is invalid"))?;
+    let prefix = 64;
+    for args in [
+        vec![
+            "link".to_string(),
+            "set".to_string(),
+            "dev".to_string(),
+            netdev.to_string(),
+            "up".to_string(),
+        ],
+        vec![
+            "-6".to_string(),
+            "addr".to_string(),
+            "replace".to_string(),
+            format!("{address}/{prefix}"),
+            "dev".to_string(),
+            netdev.to_string(),
+        ],
+        vec![
+            "-6".to_string(),
+            "route".to_string(),
+            "replace".to_string(),
+            format!("{pcscf}/128"),
+            "via".to_string(),
+            gateway.to_string(),
+            "dev".to_string(),
+            netdev.to_string(),
+        ],
+    ] {
+        let output = Command::new("ip").args(args).output().await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "failed to configure secondary IMS interface: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_qmi_packet_handle(output: &str) -> Option<String> {
@@ -531,7 +586,24 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                 .unwrap_or_default(),
                             ..RuntimeStatus::default()
                         });
-                        match register_native_ims(&conn, &settings, pcscf).await {
+                        let netdev = std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
+                            .unwrap_or_default();
+                        if let Err(error) = configure_secondary_ipv6_interface(
+                            &netdev,
+                            &settings,
+                            pcscf,
+                        )
+                        .await
+                        {
+                            let _ = write_runtime_status(&RuntimeStatus {
+                                phase: "ims_interface_failed".to_string(),
+                                transport: "native_qmi".to_string(),
+                                interface: netdev,
+                                last_error: error.to_string(),
+                                ..RuntimeStatus::default()
+                            });
+                        } else {
+                            match register_native_ims(&conn, &settings, pcscf).await {
                             Ok(()) => {
                                 registration_succeeded = true;
                                 if volte.sms_enabled {
@@ -570,6 +642,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                     last_error: error.to_string(),
                                     ..RuntimeStatus::default()
                                 });
+                            }
                             }
                         }
                     }
@@ -646,6 +719,15 @@ mod tests {
                 mtu: Some(1432),
             })
         );
+    }
+
+    #[test]
+    fn strips_qmi_ipv6_prefix_lengths() {
+        let output =
+            "IPv6 address: 2001:db8::10/64\nIPv6 gateway address: 2001:db8::1/64\nMTU: 1432";
+        let settings = super::parse_qmi_bearer_settings(output).unwrap();
+        assert_eq!(settings.ipv6_address, "2001:db8::10");
+        assert_eq!(settings.ipv6_gateway, "2001:db8::1");
     }
 
     #[test]
