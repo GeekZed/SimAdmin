@@ -2,6 +2,8 @@
 
 use anyhow::{anyhow, Result};
 use std::net::Ipv6Addr;
+use tokio::net::UdpSocket;
+use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SipRegistration {
@@ -98,6 +100,40 @@ Content-Length: 0\r\n\r\n",
     ))
 }
 
+pub fn build_initial_register(registration: &SipRegistration, branch: &str) -> Result<String> {
+    if branch.is_empty() || registration.call_id.is_empty() {
+        return Err(anyhow!("SIP branch and Call-ID are required"));
+    }
+    let uri = format!("sip:{}", registration.realm);
+    let contact_identity = registration
+        .public_identity
+        .strip_prefix("sip:")
+        .unwrap_or(&registration.public_identity);
+    let contact = format!(
+        "sip:{}@{}:{}",
+        contact_identity, registration.contact_host, registration.contact_port
+    );
+    Ok(format!(
+        "REGISTER {uri} SIP/2.0\r\n\
+Via: SIP/2.0/UDP [{}]:{};branch={branch};rport\r\n\
+From: <{}>;tag=simadmin\r\n\
+To: <{}>\r\n\
+Call-ID: {}\r\n\
+CSeq: {} REGISTER\r\n\
+Contact: <{}>\r\n\
+Max-Forwards: 70\r\n\
+User-Agent: SimAdmin\r\n\
+Content-Length: 0\r\n\r\n",
+        registration.contact_host,
+        registration.contact_port,
+        registration.public_identity,
+        registration.public_identity,
+        registration.call_id,
+        registration.cseq,
+        contact
+    ))
+}
+
 pub fn sip_status_code(response: &str) -> Option<u16> {
     let first_line = response.lines().next()?;
     let mut fields = first_line.split_whitespace();
@@ -105,6 +141,47 @@ pub fn sip_status_code(response: &str) -> Option<u16> {
         return None;
     }
     fields.next()?.parse().ok()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AkaChallenge {
+    pub realm: String,
+    pub nonce: String,
+}
+
+pub fn parse_aka_challenge(response: &str) -> Option<AkaChallenge> {
+    let header = response.lines().find(|line| {
+        line.to_ascii_lowercase().starts_with("www-authenticate:")
+            && line.to_ascii_lowercase().contains("aka")
+    })?;
+    let value = header.split_once(':')?.1;
+    let parameter = |name: &str| {
+        value.split(',').find_map(|item| {
+            let (key, value) = item.trim().split_once('=')?;
+            (key.trim().eq_ignore_ascii_case(name))
+                .then(|| value.trim().trim_matches('"').to_string())
+        })
+    };
+    Some(AkaChallenge {
+        realm: parameter("realm")?,
+        nonce: parameter("nonce")?,
+    })
+}
+
+pub async fn send_udp_request(
+    local: Ipv6Addr,
+    remote: Ipv6Addr,
+    remote_port: u16,
+    request: &str,
+) -> Result<String> {
+    let socket = UdpSocket::bind((local, 0)).await?;
+    socket.connect((remote, remote_port)).await?;
+    socket.send(request.as_bytes()).await?;
+    let mut buffer = vec![0u8; 8192];
+    let length = timeout(Duration::from_secs(10), socket.recv(&mut buffer))
+        .await
+        .map_err(|_| anyhow!("timed out waiting for SIP response"))??;
+    Ok(String::from_utf8_lossy(&buffer[..length]).into_owned())
 }
 
 #[cfg(test)]
@@ -143,5 +220,17 @@ mod tests {
     #[test]
     fn parses_sip_status() {
         assert_eq!(sip_status_code("SIP/2.0 200 OK\r\n"), Some(200));
+    }
+
+    #[test]
+    fn parses_aka_challenge() {
+        let response = "SIP/2.0 401 Unauthorized\r\nWWW-Authenticate: Digest algorithm=AKAv1-MD5, realm=\"ims.example\", nonce=\"abc\"\r\n";
+        assert_eq!(
+            parse_aka_challenge(response),
+            Some(AkaChallenge {
+                realm: "ims.example".into(),
+                nonce: "abc".into()
+            })
+        );
     }
 }
