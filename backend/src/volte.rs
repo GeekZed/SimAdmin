@@ -339,7 +339,13 @@ pub async fn register_native_ims(
     let security = crate::ims_sip::parse_security_server(&challenge_response)
         .ok_or_else(|| anyhow!("IMS 401 did not contain Security-Server"))?;
     let aka_command = crate::ims_uim::build_aka_auth_command(&challenge.nonce)?;
-    let aka_output = crate::modem_manager::send_at_command(conn, &modem_path, &aka_command)
+    let aka_output = crate::modem_manager::send_uim_apdu(
+        conn,
+        &modem_path,
+        "A0000000871002",
+        &aka_command,
+        true,
+    )
         .await
         .map_err(|error| anyhow!("IMS AKA APDU failed: {error}"))?;
     let aka_hex = crate::ims_uim::extract_csim_hex(&aka_output)?;
@@ -528,10 +534,12 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                     continue;
                                 }
                             };
-                            match crate::modem_manager::send_at_command(
+                            match crate::modem_manager::send_uim_apdu(
                                 &conn,
                                 &modem_path,
+                                "A0000000871002",
                                 &command,
+                                false,
                             )
                             .await
                             {

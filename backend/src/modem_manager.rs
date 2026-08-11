@@ -2378,6 +2378,46 @@ async fn qmi_control_device(conn: &Connection, modem_path: &str) -> Option<Strin
         .map(|port| qmi_device_path(port))
 }
 
+/// Send a USIM APDU through the modem's QMI UIM service. beta9 keeps the
+/// logical channel and APDU exchange inside one libqmi client; the helper
+/// implements that same lifetime boundary for the static SimAdmin binary.
+pub async fn send_uim_apdu(
+    conn: &Connection,
+    modem_path: &str,
+    aid: &str,
+    apdu: &str,
+    send_apdu: bool,
+) -> Result<String, String> {
+    let device = if let Some(value) = std::env::var("SIMADMIN_PRIMARY_QMI_DEVICE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        value
+    } else {
+        qmi_control_device(conn, modem_path)
+            .await
+            .unwrap_or_else(|| "/dev/wwan0qmi0".to_string())
+    };
+    let helper = std::env::var("SIMADMIN_UIM_HELPER")
+        .unwrap_or_else(|_| "/opt/simadmin/simadmin-uim-apdu".to_string());
+    let mut command = Command::new(helper);
+    command.args([device, aid.to_string(), apdu.to_string()]);
+    if send_apdu {
+        command.arg("send");
+    }
+    let output = tokio::time::timeout(Duration::from_secs(45), command.output())
+        .await
+        .map_err(|_| "QMI UIM APDU helper timed out".to_string())?
+        .map_err(|error| format!("QMI UIM APDU helper failed to start: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "QMI UIM APDU failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 async fn mbim_control_device(conn: &Connection, modem_path: &str) -> Option<String> {
     let ports = modem_ports(conn, modem_path).await;
     if let Some((port, _)) = ports

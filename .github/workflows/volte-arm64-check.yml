@@ -23,7 +23,7 @@ jobs:
       - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y musl-tools libqmi-dev libqrtr-glib-dev libglib2.0-dev
 
       - name: Build backend for ARM64
         working-directory: backend
@@ -34,9 +34,15 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --locked --release --target aarch64-unknown-linux-musl
 
+      - name: Build beta9-compatible UIM helper
+        run: |
+          gcc -O2 -o simadmin-uim-apdu scripts/simadmin-uim-apdu.c $(pkg-config --cflags --libs libqmi-glib)
+
       - name: Upload ARM64 backend
         uses: actions/upload-artifact@v4
         with:
           name: simadmin-volte-aarch64
-          path: backend/target/aarch64-unknown-linux-musl/release/simadmin
+          path: |
+            backend/target/aarch64-unknown-linux-musl/release/simadmin
+            simadmin-uim-apdu
           if-no-files-found: error
