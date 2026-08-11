@@ -13,6 +13,14 @@ pub struct IncomingImsSms {
     pub phone_number: String,
     pub content: String,
     pub marker: String,
+    pub concat: Option<ConcatInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcatInfo {
+    pub reference: u16,
+    pub total: u8,
+    pub sequence: u8,
 }
 
 pub fn parse_sip_message(packet: &[u8]) -> Result<(HashMap<String, String>, Vec<u8>)> {
@@ -91,7 +99,45 @@ fn decode_gsm7(data: &[u8], septets: usize) -> String {
         .collect()
 }
 
-fn decode_sms_deliver(tpdu: &[u8]) -> Result<(String, String)> {
+fn parse_concat_udh(data: &[u8]) -> Option<(ConcatInfo, usize)> {
+    let header_length = *data.first()? as usize;
+    if data.len() < header_length + 1 {
+        return None;
+    }
+    let mut index = 1;
+    while index + 2 <= header_length + 1 {
+        let identifier = data[index];
+        let length = data[index + 1] as usize;
+        index += 2;
+        if index + length > header_length + 1 {
+            return None;
+        }
+        if identifier == 0x00 && length == 3 {
+            return Some((
+                ConcatInfo {
+                    reference: data[index] as u16,
+                    total: data[index + 1],
+                    sequence: data[index + 2],
+                },
+                header_length + 1,
+            ));
+        }
+        if identifier == 0x08 && length == 4 {
+            return Some((
+                ConcatInfo {
+                    reference: u16::from_be_bytes([data[index], data[index + 1]]),
+                    total: data[index + 2],
+                    sequence: data[index + 3],
+                },
+                header_length + 1,
+            ));
+        }
+        index += length;
+    }
+    None
+}
+
+fn decode_sms_deliver(tpdu: &[u8]) -> Result<(String, String, Option<ConcatInfo>)> {
     if tpdu.len() < 2 || tpdu[0] & 0x03 != 0x00 {
         return Err(anyhow!("IMS TPDU is not SMS-DELIVER"));
     }
@@ -109,18 +155,30 @@ fn decode_sms_deliver(tpdu: &[u8]) -> Result<(String, String)> {
         if data.len() < length || length % 2 != 0 {
             return Err(anyhow!("IMS UCS2 SMS data is truncated"));
         }
-        String::from_utf16(
-            &data[..length]
+        let (concat, header_bytes) = if tpdu[0] & 0x40 != 0 {
+            parse_concat_udh(data)
+                .map(|(info, length)| (Some(info), length))
+                .unwrap_or((None, 0))
+        } else {
+            (None, 0)
+        };
+        if header_bytes > length {
+            return Err(anyhow!("IMS SMS UDH exceeds user data length"));
+        }
+        let content_data = &data[header_bytes..length];
+        let content = String::from_utf16(
+            &content_data
                 .chunks_exact(2)
                 .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
                 .collect::<Vec<_>>(),
-        )?
+        )?;
+        return Ok((phone_number, content, concat));
     } else if dcs & 0x0c == 0x00 {
         decode_gsm7(data, length)
     } else {
         String::from_utf8_lossy(&data[..length.min(data.len())]).into_owned()
     };
-    Ok((phone_number, content))
+    Ok((phone_number, content, None))
 }
 
 pub fn decode_ims_sms(body_hex: &str) -> Result<IncomingImsSms> {
@@ -142,12 +200,14 @@ pub fn decode_ims_sms(body_hex: &str) -> Result<IncomingImsSms> {
     if rp_data.len() < index + user_data_length {
         return Err(anyhow!("IMS RP-DATA user data is truncated"));
     }
-    let (phone_number, content) = decode_sms_deliver(&rp_data[index..index + user_data_length])?;
+    let (phone_number, content, concat) =
+        decode_sms_deliver(&rp_data[index..index + user_data_length])?;
     let marker = format!("volte-mt:{:x}", md5::compute(body_hex.as_bytes()));
     Ok(IncomingImsSms {
         phone_number,
         content,
         marker,
+        concat,
     })
 }
 
@@ -201,6 +261,7 @@ pub async fn run_ims_sms_listener(
 ) -> Result<()> {
     let socket = UdpSocket::bind((local, port)).await?;
     let mut buffer = vec![0u8; 8192];
+    let mut multipart: HashMap<(String, u16), Vec<Option<IncomingImsSms>>> = HashMap::new();
     loop {
         let (length, peer) = socket.recv_from(&mut buffer).await?;
         let packet = &buffer[..length];
@@ -225,9 +286,42 @@ pub async fn run_ims_sms_listener(
             let ack_hex: String = ack.iter().map(|byte| format!("{byte:02X}")).collect();
             tracing::debug!(rp_ack = %ack_hex, "IMS SMS RP-ACK prepared");
         }
-        let Ok(incoming) = decode_ims_sms_body(&body) else {
+        let Ok(mut incoming) = decode_ims_sms_body(&body) else {
             continue;
         };
+        if let Some(concat) = incoming.concat.clone() {
+            if concat.total == 0 || concat.sequence == 0 || concat.sequence > concat.total {
+                continue;
+            }
+            let key = (incoming.phone_number.clone(), concat.reference);
+            let segments = multipart
+                .entry(key.clone())
+                .or_insert_with(|| vec![None; concat.total as usize]);
+            if segments.len() != concat.total as usize {
+                *segments = vec![None; concat.total as usize];
+            }
+            segments[concat.sequence as usize - 1] = Some(incoming);
+            if segments.iter().any(Option::is_none) {
+                continue;
+            }
+            let segments = multipart.remove(&key).unwrap();
+            let complete = segments.into_iter().flatten().collect::<Vec<_>>();
+            let phone_number = complete[0].phone_number.clone();
+            let content = complete
+                .iter()
+                .map(|segment| segment.content.as_str())
+                .collect::<String>();
+            let marker_input = complete
+                .iter()
+                .map(|segment| segment.marker.as_str())
+                .collect::<String>();
+            incoming = IncomingImsSms {
+                phone_number,
+                content,
+                marker: format!("volte-mt:{:x}", md5::compute(marker_input.as_bytes())),
+                concat: None,
+            };
+        }
         if database.sms_exists_by_pdu(&incoming.marker)? {
             continue;
         }
@@ -265,6 +359,22 @@ mod tests {
         assert_eq!(sms.phone_number, "+12345678901");
         assert_eq!(sms.content, "你好");
         assert!(sms.marker.starts_with("volte-mt:"));
+    }
+
+    #[test]
+    fn decodes_ucs2_concat_header() {
+        let tpdu = "440B912143658709F10008321223101234000A0500030102014F60597D";
+        let rp = format!("00000000{:02X}{}", tpdu.len() / 2, tpdu);
+        let sms = decode_ims_sms(&rp).unwrap();
+        assert_eq!(sms.content, "你好");
+        assert_eq!(
+            sms.concat,
+            Some(ConcatInfo {
+                reference: 1,
+                total: 2,
+                sequence: 1
+            })
+        );
     }
 
     #[test]
