@@ -1,5 +1,6 @@
 #include <glib.h>
 #include <libqmi-glib.h>
+#include <libqmi-glib/qmi-uim.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
