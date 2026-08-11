@@ -253,6 +253,50 @@ fn sip_ok_response(headers: &HashMap<String, String>) -> String {
     response
 }
 
+fn header_uri(value: &str) -> Option<String> {
+    if let Some((_, rest)) = value.split_once('<') {
+        return Some(rest.split('>').next()?.to_string());
+    }
+    Some(value.split(';').next()?.trim().to_string())
+}
+
+pub fn build_rp_ack_message(
+    headers: &HashMap<String, String>,
+    local: std::net::Ipv6Addr,
+    local_port: u16,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let target = header_uri(
+        headers
+            .get("from")
+            .ok_or_else(|| anyhow!("IMS SMS From header is missing"))?,
+    )
+    .ok_or_else(|| anyhow!("IMS SMS From URI is missing"))?;
+    let from = headers
+        .get("to")
+        .ok_or_else(|| anyhow!("IMS SMS To header is missing"))?;
+    let to = headers
+        .get("from")
+        .ok_or_else(|| anyhow!("IMS SMS From header is missing"))?;
+    let call_id = headers
+        .get("call-id")
+        .ok_or_else(|| anyhow!("IMS SMS Call-ID header is missing"))?;
+    let cseq = headers
+        .get("cseq")
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1)
+        .saturating_add(1);
+    let branch = format!("z9hG4bK-simadmin-rp-ack-{cseq}");
+    let header = format!(
+        "MESSAGE {target} SIP/2.0\r\nVia: SIP/2.0/UDP [{local}]:{local_port};branch={branch};rport\r\nFrom: {from}\r\nTo: {to}\r\nCall-ID: {call_id}\r\nCSeq: {cseq} MESSAGE\r\nContent-Type: application/vnd.3gpp.sms\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut packet = header.into_bytes();
+    packet.extend_from_slice(body);
+    Ok(packet)
+}
+
 pub async fn run_ims_sms_listener(
     local: std::net::Ipv6Addr,
     port: u16,
@@ -283,8 +327,9 @@ pub async fn run_ims_sms_listener(
         let response = sip_ok_response(&headers);
         let _ = socket.send_to(response.as_bytes(), peer).await;
         if let Ok(ack) = build_rp_ack(&body) {
-            let ack_hex: String = ack.iter().map(|byte| format!("{byte:02X}")).collect();
-            tracing::debug!(rp_ack = %ack_hex, "IMS SMS RP-ACK prepared");
+            if let Ok(packet) = build_rp_ack_message(&headers, local, port, &ack) {
+                let _ = socket.send_to(&packet, peer).await;
+            }
         }
         let Ok(mut incoming) = decode_ims_sms_body(&body) else {
             continue;
@@ -394,5 +439,23 @@ mod tests {
     #[test]
     fn builds_matching_rp_ack() {
         assert_eq!(build_rp_ack(&[0x00, 0x37, 0x00, 0x00]).unwrap(), vec![0x02, 0x37]);
+    }
+
+    #[test]
+    fn builds_rp_ack_sip_message() {
+        let mut headers = HashMap::new();
+        headers.insert("from".into(), "<sip:network@example>;tag=n".into());
+        headers.insert("to".into(), "<sip:me@example>;tag=m".into());
+        headers.insert("call-id".into(), "call".into());
+        headers.insert("cseq".into(), "1 MESSAGE".into());
+        let packet = build_rp_ack_message(
+            &headers,
+            "2001:db8::10".parse().unwrap(),
+            5062,
+            &[0x02, 0x37],
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&packet).contains("MESSAGE sip:network@example SIP/2.0"));
+        assert!(packet.ends_with(&[0x02, 0x37]));
     }
 }
