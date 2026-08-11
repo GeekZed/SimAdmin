@@ -126,6 +126,7 @@ pub async fn start_secondary_ims_bearer(
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
+                "--device-open-qmi",
                 "--wds-set-ip-family=6",
             ])
             .output(),
@@ -146,6 +147,7 @@ pub async fn start_secondary_ims_bearer(
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
+                "--device-open-qmi",
                 &start_arg,
             ])
             .output(),
@@ -175,6 +177,7 @@ pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBeare
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
+                "--device-open-qmi",
                 "--wds-get-current-settings",
             ])
             .output(),
@@ -317,6 +320,7 @@ pub async fn secondary_ims_bearer_connected(qmi_device: &str) -> Result<bool> {
                 "-d",
                 qmi_device,
                 "--device-open-proxy",
+                "--device-open-qmi",
                 "--wds-get-packet-service-status",
             ])
             .output(),
@@ -344,7 +348,13 @@ pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) ->
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("qmicli")
-            .args(["-d", qmi_device, "--device-open-proxy", &stop_arg])
+            .args([
+                "-d",
+                qmi_device,
+                "--device-open-proxy",
+                "--device-open-qmi",
+                &stop_arg,
+            ])
             .output(),
     )
     .await
