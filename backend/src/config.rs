@@ -1847,6 +1847,28 @@ pub struct EsimConfig {
     pub custom_memory_total_kb: Option<u32>,
 }
 
+/// Native IMS/VoLTE runtime settings.
+///
+/// The runtime is deliberately opt-in until the DATA6/QMI and IMS paths have
+/// been verified on the target modem. `sms_enabled` controls the native IMS
+/// SMS receiver independently from the regular ModemManager SMS listener.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolteConfig {
+    #[serde(default)]
+    pub feature_enabled: bool,
+    #[serde(default)]
+    pub sms_enabled: bool,
+}
+
+impl Default for VolteConfig {
+    fn default() -> Self {
+        Self {
+            feature_enabled: false,
+            sms_enabled: false,
+        }
+    }
+}
+
 impl Default for EsimConfig {
     fn default() -> Self {
         Self {
@@ -1881,6 +1903,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub esim: EsimConfig,
     #[serde(default)]
+    pub volte: VolteConfig,
+    #[serde(default)]
     pub automation: AutomationConfig,
     #[serde(default)]
     pub backup: BackupConfig,
@@ -1899,6 +1923,7 @@ impl Default for AppConfig {
             apn: ApnConfig::default(),
             work_mode: WorkMode::default(),
             esim: EsimConfig::default(),
+            volte: VolteConfig::default(),
             automation: AutomationConfig::default(),
             backup: BackupConfig::default(),
         }

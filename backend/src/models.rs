@@ -897,6 +897,14 @@ pub struct ImsStatusResponse {
     pub registered: bool,
     pub voice_capable: bool,
     pub sms_capable: bool,
+    #[serde(default)]
+    pub phase: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub interface: String,
+    #[serde(default)]
+    pub last_error: String,
 }
 
 #[derive(Debug, Serialize, Default)]

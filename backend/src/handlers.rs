@@ -3213,11 +3213,19 @@ pub async fn set_call_forwarding_handler(
 }
 
 pub async fn get_ims_status_handler() -> impl IntoResponse {
+    let runtime = crate::volte::read_runtime_status().unwrap_or_default();
+    let status = ImsStatusResponse {
+        registered: runtime.registered,
+        voice_capable: runtime.registered,
+        sms_capable: runtime.sms_ready,
+        phase: runtime.phase,
+        transport: runtime.transport,
+        interface: runtime.interface,
+        last_error: runtime.last_error,
+    };
     (
         StatusCode::OK,
-        Json(ApiResponse::<ImsStatusResponse>::error(
-            "IMS status is not exposed by ModemManager on this backend",
-        )),
+        Json(ApiResponse::success_with_message("IMS runtime status", status)),
     )
 }
 
