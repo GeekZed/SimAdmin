@@ -1716,7 +1716,20 @@ pub async fn send_at_command(
     modem_path: &str,
     command: &str,
 ) -> Result<String, String> {
-    send_at_via_modem_command(conn, modem_path, command).await
+    match send_at_via_modem_command(conn, modem_path, command).await {
+        Ok(output) => Ok(output),
+        Err(modem_command_error) => {
+            with_serial(async {
+                run_direct_at_command_draining(conn, command).await
+            })
+            .await
+            .map_err(|direct_error| {
+                format!(
+                    "Modem.Command failed: {modem_command_error}; direct AT fallback failed: {direct_error}"
+                )
+            })
+        }
+    }
 }
 
 /// 后台异步获取 SMSC 并写入缓存。
