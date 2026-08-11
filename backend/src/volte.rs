@@ -152,6 +152,19 @@ pub fn parse_qmi_packet_handle(output: &str) -> Option<String> {
     })
 }
 
+pub fn secondary_netdev(qmi_device: &str) -> String {
+    if let Ok(value) = std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV") {
+        if !value.trim().is_empty() {
+            return value;
+        }
+    }
+    if qmi_device == "/dev/wwan0at2" {
+        "wwan1".to_string()
+    } else {
+        String::new()
+    }
+}
+
 pub fn parse_qmi_connection_status(output: &str) -> Option<bool> {
     output.lines().find_map(|line| {
         let (label, value) = line.split_once(':')?;
@@ -225,7 +238,13 @@ pub async fn start_secondary_ims_bearer(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let handle = parse_qmi_packet_handle(&stdout)
         .ok_or_else(|| anyhow!("qmicli did not return a packet data handle"))?;
-    let settings = read_secondary_bearer_settings(qmi_device).await?;
+    let settings = match read_secondary_bearer_settings(qmi_device).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            let _ = stop_secondary_ims_bearer(qmi_device, &handle).await;
+            return Err(error);
+        }
+    };
     Ok((handle, settings))
 }
 
@@ -481,11 +500,12 @@ pub async fn run_secondary_ims_bearer_supervisor(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             };
+            let netdev = secondary_netdev(&device);
 
             let _ = write_runtime_status(&RuntimeStatus {
                 phase: "starting_ims_bearer".to_string(),
                 transport: "native_qmi".to_string(),
-                interface: std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV").unwrap_or_default(),
+                interface: netdev.clone(),
                 ..RuntimeStatus::default()
             });
             match start_secondary_ims_bearer(&device, "ims").await {
@@ -582,12 +602,9 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         let _ = write_runtime_status(&RuntimeStatus {
                             phase: "ims_registering".to_string(),
                             transport: "native_qmi_ipsec".to_string(),
-                            interface: std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
-                                .unwrap_or_default(),
+                            interface: netdev.clone(),
                             ..RuntimeStatus::default()
                         });
-                        let netdev = std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
-                            .unwrap_or_default();
                         if let Err(error) = configure_secondary_ipv6_interface(
                             &netdev,
                             &settings,
@@ -598,7 +615,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                             let _ = write_runtime_status(&RuntimeStatus {
                                 phase: "ims_interface_failed".to_string(),
                                 transport: "native_qmi".to_string(),
-                                interface: netdev,
+                                interface: netdev.clone(),
                                 last_error: error.to_string(),
                                 ..RuntimeStatus::default()
                             });
@@ -630,8 +647,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                     registered: true,
                                     sms_ready: volte.sms_enabled,
                                     transport: "native_qmi_ipsec".to_string(),
-                                    interface: std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
-                                        .unwrap_or_default(),
+                                    interface: netdev.clone(),
                                     ..RuntimeStatus::default()
                                 });
                             }
@@ -656,8 +672,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         let _ = write_runtime_status(&RuntimeStatus {
                             phase: "bearer_connected".to_string(),
                             transport: "native_qmi".to_string(),
-                            interface: std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
-                                .unwrap_or_default(),
+                            interface: netdev.clone(),
                             ..RuntimeStatus::default()
                         });
                     }
@@ -736,6 +751,11 @@ mod tests {
             super::parse_qmi_packet_handle("Packet data handle: '42'"),
             Some("42".to_string())
         );
+    }
+
+    #[test]
+    fn derives_beta9_secondary_netdev() {
+        assert_eq!(super::secondary_netdev("/dev/wwan0at2"), "wwan1");
     }
 
     #[test]
