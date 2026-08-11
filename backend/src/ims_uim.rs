@@ -1,6 +1,7 @@
 //! USIM application and AKA response parsing for native IMS.
 
 use anyhow::{anyhow, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AkaResponse {
@@ -43,6 +44,27 @@ pub fn extract_csim_hex(response: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Modem response did not contain CSIM hex data"))?;
     decode_hex(value)?;
     Ok(value.to_string())
+}
+
+pub fn build_aka_auth_command(nonce: &str) -> Result<String> {
+    let nonce = nonce.trim().trim_matches('"');
+    let auth_data = STANDARD
+        .decode(nonce)
+        .or_else(|_| decode_hex(nonce))
+        .map_err(|_| anyhow!("IMS AKA nonce is not base64 or hexadecimal"))?;
+    if auth_data.len() != 32 {
+        return Err(anyhow!("IMS AKA nonce must contain 16-byte RAND and AUTN"));
+    }
+    let apdu = format!(
+        "008800812210{}{}",
+        encode_hex(&auth_data[..16]),
+        encode_hex(&auth_data[16..])
+    );
+    build_csim_command(&apdu)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 pub fn parse_aid_from_select_response(response_hex: &str) -> Result<Vec<u8>> {
@@ -122,6 +144,14 @@ mod tests {
             extract_csim_hex(r#"+CSIM: 144,0,"62098407A0000000871002""#).unwrap(),
             "62098407A0000000871002"
         );
+    }
+
+    #[test]
+    fn builds_aka_auth_apdu_from_base64_nonce() {
+        let nonce = STANDARD.encode([0x11u8; 32]);
+        let command = build_aka_auth_command(&nonce).unwrap();
+        assert!(command.contains("008800812210"));
+        assert!(command.ends_with("\""));
     }
 
     #[test]
