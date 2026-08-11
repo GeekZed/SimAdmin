@@ -135,6 +135,25 @@ fn wait_for_secondary_device(timeout: Duration) -> Result<String> {
     }
 }
 
+#[cfg(unix)]
+fn notify_ready() {
+    let Some(socket) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let socket = socket.to_string_lossy();
+    let socket = if let Some(abstract_name) = socket.strip_prefix('@') {
+        format!("\0{abstract_name}")
+    } else {
+        socket.into_owned()
+    };
+    if let Ok(datagram) = std::os::unix::net::UnixDatagram::unbound() {
+        let _ = datagram.send_to(b"READY=1\nSTATUS=DATA6 secondary QMI ready", socket);
+    }
+}
+
+#[cfg(not(unix))]
+fn notify_ready() {}
+
 pub fn initialize_and_hold() -> Result<()> {
     run_modprobe()?;
     let device = data6_rpmsg_device()?;
@@ -142,6 +161,7 @@ pub fn initialize_and_hold() -> Result<()> {
     fs::create_dir_all(Path::new(SECONDARY_DEVICE_STATE).parent().unwrap())?;
     let secondary = wait_for_secondary_device(Duration::from_secs(20))?;
     fs::write(SECONDARY_DEVICE_STATE, format!("{secondary}\n"))?;
+    notify_ready();
 
     // Keep the systemd unit alive so ModemManager cannot reclaim the endpoint.
     loop {

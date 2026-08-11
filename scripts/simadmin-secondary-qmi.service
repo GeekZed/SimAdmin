@@ -4,7 +4,8 @@ After=systemd-udevd.service systemd-modules-load.service
 Before=ModemManager.service simadmin.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 User=root
 ExecStart=/opt/simadmin/simadmin secondary-qmi-init
 Restart=on-failure
