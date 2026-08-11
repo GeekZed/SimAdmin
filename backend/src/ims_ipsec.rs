@@ -15,7 +15,6 @@ pub struct EspSecurityAssociation {
     pub remote: Ipv6Addr,
     pub spi: u32,
     pub auth_key_hex: String,
-    pub enc_key_hex: String,
 }
 
 impl EspSecurityAssociation {
@@ -23,11 +22,11 @@ impl EspSecurityAssociation {
         if self.spi == 0 {
             return Err(anyhow!("IPsec SPI must be non-zero"));
         }
-        if self.auth_key_hex.is_empty() || self.enc_key_hex.is_empty() {
-            return Err(anyhow!("IPsec keys must not be empty"));
+        if self.auth_key_hex.is_empty() {
+            return Err(anyhow!("IPsec authentication key must not be empty"));
         }
-        if !is_hex(&self.auth_key_hex) || !is_hex(&self.enc_key_hex) {
-            return Err(anyhow!("IPsec keys must be hexadecimal"));
+        if !is_hex(&self.auth_key_hex) {
+            return Err(anyhow!("IPsec authentication key must be hexadecimal"));
         }
         Ok(())
     }
@@ -48,12 +47,11 @@ impl EspSecurityAssociation {
             "mode".into(),
             "transport".into(),
             "auth-trunc".into(),
-            "hmac(sha1)".into(),
+            "hmac(md5)".into(),
             self.auth_key_hex.clone(),
             "96".into(),
             "enc".into(),
-            "cbc(aes)".into(),
-            self.enc_key_hex.clone(),
+            "cipher_null".into(),
         ]
     }
 }
@@ -88,7 +86,6 @@ mod tests {
             remote: "2001:db8::2".parse().unwrap(),
             spi: 0x1234,
             auth_key_hex: "aa".repeat(20),
-            enc_key_hex: "bb".repeat(16),
         }
     }
 
