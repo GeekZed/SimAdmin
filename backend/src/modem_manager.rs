@@ -5155,6 +5155,20 @@ async fn run_direct_at_command_draining(
 }
 
 #[cfg(unix)]
+fn configure_at_port(fd: std::os::fd::RawFd) {
+    unsafe {
+        let mut termios = std::mem::zeroed::<libc::termios>();
+        if libc::tcgetattr(fd, &mut termios) == 0 {
+            libc::cfmakeraw(&mut termios);
+            termios.c_cflag |= libc::CLOCAL | libc::CREAD;
+            let _ = libc::cfsetispeed(&mut termios, libc::B115200);
+            let _ = libc::cfsetospeed(&mut termios, libc::B115200);
+            let _ = libc::tcsetattr(fd, libc::TCSANOW, &termios);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn run_direct_at_command_blocking(device: &str, command: &str) -> Result<String, String> {
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
@@ -5166,6 +5180,7 @@ fn run_direct_at_command_blocking(device: &str, command: &str) -> Result<String,
         .map_err(|err| format!("打开 AT 端口 {device} 失败：{err}"))?;
 
     let fd = port.as_raw_fd();
+    configure_at_port(fd);
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {
@@ -5233,6 +5248,7 @@ fn run_direct_at_command_draining_blocking(
         .map_err(|err| format!("打开 AT 端口 {device} 失败：{err}"))?;
 
     let fd = port.as_raw_fd();
+    configure_at_port(fd);
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags >= 0 {
