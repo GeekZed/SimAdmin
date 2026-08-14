@@ -1173,6 +1173,18 @@ main() {
   echo "==> installing files to ${INSTALL_DIR}"
   mkdir -p "${INSTALL_DIR}"
   install -m 0755 "${tmp_dir}/pkg/simadmin" "${INSTALL_DIR}/simadmin"
+  if [ -f "${tmp_dir}/pkg/qmi-ims-helper.c" ]; then
+    if command -v cc >/dev/null 2>&1 && command -v pkg-config >/dev/null 2>&1 && pkg-config --exists qmi-glib; then
+      echo "==> building native QMI IMS helper"
+      cc -O2 -Wall -Wextra \
+        "${tmp_dir}/pkg/qmi-ims-helper.c" \
+        $(pkg-config --cflags --libs qmi-glib gio-2.0 glib-2.0) \
+        -o "${INSTALL_DIR}/qmi-ims-helper"
+      chmod 0755 "${INSTALL_DIR}/qmi-ims-helper"
+    else
+      echo "warning: native QMI IMS helper was not built; install cc, pkg-config and qmi-glib development files" >&2
+    fi
+  fi
   rm -rf "${INSTALL_DIR}/www"
   cp -R "${tmp_dir}/pkg/www" "${INSTALL_DIR}/www"
   chmod -R a+rX "${INSTALL_DIR}/www"

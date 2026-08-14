@@ -1,0 +1,14 @@
+[Unit]
+Description=SimAdmin beta9 IMS SIP registration capture
+Before=simadmin.service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/simadmin/capture-beta9-sip.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

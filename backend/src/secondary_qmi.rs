@@ -94,14 +94,14 @@ fn candidate_secondary_devices() -> Vec<String> {
 
     let primary = std::env::var("SIMADMIN_PRIMARY_QMI_DEVICE")
         .unwrap_or_else(|_| "/dev/wwan0qmi0".to_string());
-    let mut candidates = vec![
-        "/dev/wwan0qmi1".to_string(),
-        "/dev/wwan0at2".to_string(),
-    ];
+    // beta9 exposes DATA6 as /dev/wwan0at2.  Although the kernel labels the
+    // port AT, it carries the QMI WDS traffic used by the IMS runtime.
+    let mut candidates = vec!["/dev/wwan0at2".to_string()];
     if let Ok(entries) = fs::read_dir("/dev") {
         candidates.extend(entries.flatten().filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
-            name.starts_with("wwan0")
+            ((name.starts_with("wwan0qmi") && name != "wwan0qmi0")
+                || name == "wwan0at2")
                 .then(|| entry.path().to_string_lossy().into_owned())
         }));
     }
@@ -117,13 +117,6 @@ fn wait_for_secondary_device(timeout: Duration) -> Result<String> {
         for device in candidate_secondary_devices() {
             if Path::new(&device).exists() && qmi_device_ready(&device) {
                 return Ok(device);
-            }
-        }
-
-        if let Ok(device) = fs::read_to_string(SECONDARY_DEVICE_STATE) {
-            let device = device.trim();
-            if !device.is_empty() && Path::new(device).exists() {
-                return Ok(device.to_string());
             }
         }
 
@@ -158,6 +151,9 @@ pub fn initialize_and_hold() -> Result<()> {
     let device = data6_rpmsg_device()?;
     bind_data6(&device)?;
     fs::create_dir_all(Path::new(SECONDARY_DEVICE_STATE).parent().unwrap())?;
+    // Never reuse a stale AT-port path from a previous boot.  The state file
+    // is written only after the fresh endpoint passes qmicli validation.
+    let _ = fs::remove_file(SECONDARY_DEVICE_STATE);
     let secondary = wait_for_secondary_device(Duration::from_secs(20))?;
     fs::write(SECONDARY_DEVICE_STATE, format!("{secondary}\n"))?;
     notify_ready();

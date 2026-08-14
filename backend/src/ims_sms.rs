@@ -299,15 +299,17 @@ pub fn build_rp_ack_message(
 
 pub async fn run_ims_sms_listener(
     local: std::net::Ipv6Addr,
-    port: u16,
+    receive_port: u16,
+    send_port: u16,
     database: Arc<Database>,
     notifications: Arc<NotificationSender>,
 ) -> Result<()> {
-    let socket = UdpSocket::bind((local, port)).await?;
+    let receive_socket = UdpSocket::bind((local, receive_port)).await?;
+    let send_socket = UdpSocket::bind((local, send_port)).await?;
     let mut buffer = vec![0u8; 8192];
     let mut multipart: HashMap<(String, u16), Vec<Option<IncomingImsSms>>> = HashMap::new();
     loop {
-        let (length, peer) = socket.recv_from(&mut buffer).await?;
+        let (length, peer) = receive_socket.recv_from(&mut buffer).await?;
         let packet = &buffer[..length];
         let Ok((headers, body)) = parse_sip_message(packet) else {
             continue;
@@ -325,10 +327,10 @@ pub async fn run_ims_sms_listener(
             continue;
         }
         let response = sip_ok_response(&headers);
-        let _ = socket.send_to(response.as_bytes(), peer).await;
+        let _ = send_socket.send_to(response.as_bytes(), peer).await;
         if let Ok(ack) = build_rp_ack(&body) {
-            if let Ok(packet) = build_rp_ack_message(&headers, local, port, &ack) {
-                let _ = socket.send_to(&packet, peer).await;
+            if let Ok(packet) = build_rp_ack_message(&headers, local, receive_port, &ack) {
+                let _ = send_socket.send_to(&packet, peer).await;
             }
         }
         let Ok(mut incoming) = decode_ims_sms_body(&body) else {

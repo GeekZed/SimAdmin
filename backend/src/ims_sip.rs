@@ -13,6 +13,7 @@ pub struct SipRegistration {
     pub nonce: String,
     pub aka_res_hex: String,
     pub call_id: String,
+    pub from_tag: String,
     pub cseq: u32,
     pub contact_host: Ipv6Addr,
     pub contact_port: u16,
@@ -39,14 +40,36 @@ pub fn parse_pcscf_from_cgcontrdp(output: &str) -> Option<Ipv6Addr> {
         if !line.to_ascii_uppercase().starts_with("+CGCONTRDP:") {
             return None;
         }
-        line.split_once(':')?
-            .1
-            .split(',')
+        let fields = line.split_once(':')?.1.split(',').map(str::trim);
+        let fields: Vec<_> = fields.collect();
+        if !fields
+            .get(2)?
+            .trim_matches(['\'', '"'])
+            .eq_ignore_ascii_case("ims")
+        {
+            return None;
+        }
+        fields
+            .iter()
             .skip(8)
             .take(2)
-            .map(|value| value.trim().trim_matches(['\'', '"', '[', ']']))
-            .find_map(|value| value.parse().ok())
+            .find_map(|value| parse_cgcontrdp_ipv6(value).filter(|address| !address.is_unspecified()))
     })
+}
+
+fn parse_cgcontrdp_ipv6(value: &str) -> Option<Ipv6Addr> {
+    let value = value.trim_matches(['\'', '"', '[', ']']);
+    if let Ok(address) = value.parse() {
+        return Some(address);
+    }
+    let octets: Vec<u8> = value
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect::<Option<_>>()?;
+    if octets.len() != 16 {
+        return None;
+    }
+    Some(Ipv6Addr::from(<[u8; 16]>::try_from(octets).ok()?))
 }
 
 fn md5_hex(value: &str) -> String {
@@ -87,23 +110,28 @@ pub fn build_register(registration: &SipRegistration, branch: &str) -> Result<St
         .public_identity
         .strip_prefix("sip:")
         .unwrap_or(&registration.public_identity);
-    let contact = format!("sip:{}@{}:{}", contact_identity, registration.contact_host, registration.contact_port);
+    let contact_user = contact_identity.split('@').next().unwrap_or(contact_identity);
+    let contact = format!(
+        "sip:{}@[{}]:{};transport=UDP;+g.3gpp.accesstype=\"3GPP-E-UTRAN-FDD\";+g.3gpp.smsip;expires=3600",
+        contact_user, registration.contact_host, registration.contact_port
+    );
 
     Ok(format!(
         "REGISTER {uri} SIP/2.0\r\n\
 Via: SIP/2.0/UDP [{}]:{};branch={branch};rport\r\n\
-From: <{}>;tag=simadmin\r\n\
+From: <{}>;tag={}\r\n\
 To: <{}>\r\n\
 Call-ID: {}\r\n\
 CSeq: {} REGISTER\r\n\
 Contact: <{}>\r\n\
 Max-Forwards: 70\r\n\
-User-Agent: SimAdmin\r\n\
+User-Agent: SimAdmin VoLTE\r\n\
 Authorization: Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{}\", algorithm=AKAv1-MD5\r\n\
 Content-Length: 0\r\n\r\n",
         registration.contact_host,
         registration.contact_port,
         registration.public_identity,
+        registration.from_tag,
         registration.public_identity,
         registration.call_id,
         registration.cseq,
@@ -116,7 +144,12 @@ Content-Length: 0\r\n\r\n",
     ))
 }
 
-pub fn build_initial_register(registration: &SipRegistration, branch: &str) -> Result<String> {
+pub fn build_initial_register(
+    registration: &SipRegistration,
+    branch: &str,
+    access_network_info: &str,
+    security_header: &str,
+) -> Result<String> {
     if branch.is_empty() || registration.call_id.is_empty() {
         return Err(anyhow!("SIP branch and Call-ID are required"));
     }
@@ -125,28 +158,37 @@ pub fn build_initial_register(registration: &SipRegistration, branch: &str) -> R
         .public_identity
         .strip_prefix("sip:")
         .unwrap_or(&registration.public_identity);
+    let contact_user = contact_identity.split('@').next().unwrap_or(contact_identity);
     let contact = format!(
-        "sip:{}@{}:{}",
-        contact_identity, registration.contact_host, registration.contact_port
+        "sip:{}@[{}]:{};transport=UDP;+g.3gpp.accesstype=\"3GPP-E-UTRAN-FDD\";+g.3gpp.smsip;expires=3600",
+        contact_user, registration.contact_host, registration.contact_port
     );
     Ok(format!(
         "REGISTER {uri} SIP/2.0\r\n\
 Via: SIP/2.0/UDP [{}]:{};branch={branch};rport\r\n\
-From: <{}>;tag=simadmin\r\n\
+From: <{}>;tag={}\r\n\
 To: <{}>\r\n\
 Call-ID: {}\r\n\
 CSeq: {} REGISTER\r\n\
 Contact: <{}>\r\n\
-Max-Forwards: 70\r\n\
-User-Agent: SimAdmin\r\n\
+P-Visited-Network-ID: \"{realm}\"\r\n\
+P-Access-Network-Info: {access_network_info}\r\n\
+Authorization: Digest username=\"{private_identity}\", realm=\"\", nonce=\"\", uri=\"{uri}\", response=\"\", algorithm=AKAv1-MD5\r\n\
+{security_header}\
 Content-Length: 0\r\n\r\n",
         registration.contact_host,
         registration.contact_port,
         registration.public_identity,
+        registration.from_tag,
         registration.public_identity,
         registration.call_id,
         registration.cseq,
-        contact
+        contact,
+        realm = registration.realm.strip_prefix("ims.").unwrap_or(&registration.realm),
+        private_identity = registration.private_identity,
+        uri = uri,
+        access_network_info = access_network_info,
+        security_header = security_header
     ))
 }
 
@@ -205,10 +247,38 @@ pub fn build_security_client_header(
     server_spi: u32,
     client_port: u16,
     server_port: u16,
-) -> String {
+    ) -> String {
     format!(
-        "Security-Client: ipsec-3gpp;prot=esp;mod=trans;spi-c=0x{client_spi:08x};spi-s=0x{server_spi:08x};port-c={client_port};port-s={server_port};alg=hmac-md5-96;ealg=null\r\n"
+        "Security-Client: ipsec-3gpp;prot=esp;mod=trans;spi-c={client_spi};spi-s={server_spi};port-c={client_port};port-s={server_port};alg=hmac-md5-96;ealg=null\r\n"
     )
+}
+
+pub fn build_lte_access_network_info(mcc: &str, mnc: &str, cell_id: u32) -> Option<String> {
+    let mcc: Vec<u8> = mcc
+        .bytes()
+        .map(|digit| digit.checked_sub(b'0'))
+        .collect::<Option<_>>()?;
+    let mnc_digits: Vec<u8> = mnc
+        .bytes()
+        .map(|digit| digit.checked_sub(b'0'))
+        .collect::<Option<_>>()?;
+    if mcc.len() != 3 || !(mnc_digits.len() == 2 || mnc_digits.len() == 3) || mcc.iter().any(|d| *d > 9) || mnc_digits.iter().any(|d| *d > 9) {
+        return None;
+    }
+    let mnc = if mnc_digits.len() == 2 {
+        [0x0f, mnc_digits[0], mnc_digits[1]]
+    } else {
+        [mnc_digits[0], mnc_digits[1], mnc_digits[2]]
+    };
+    let plmn = [
+        (mcc[1] << 4) | mcc[0],
+        (mcc[2] << 4) | mnc[0],
+        (mnc[2] << 4) | mnc[1],
+    ];
+    Some(format!(
+        "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp={:02x}{:02x}{:02x}{cell_id:08x}",
+        plmn[0], plmn[1], plmn[2]
+    ))
 }
 
 pub fn build_register_with_security(
@@ -295,6 +365,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_dotted_pcscf_from_cgcontrdp() {
+        let response = "+CGCONTRDP: 4,15,ims,36.14.5.91.6.168.209.183.0.0.0.0.0.0.0.1,128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,,,36.14.0.102.192.0.96.15.0.0.0.0.0.0.0.1,36.14.0.102.192.0.64.9.0.0.0.0.0.0.0.1";
+        assert_eq!(
+            parse_pcscf_from_cgcontrdp(response),
+            Some("240e:66:c000:4009::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn builds_lte_access_network_info() {
+        assert_eq!(
+            build_lte_access_network_info("460", "11", 0x02a98739).as_deref(),
+            Some("3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=640f1102a98739")
+        );
+    }
+
+    #[test]
     fn builds_aka_register() {
         let request = build_register(
             &SipRegistration {
@@ -304,6 +391,7 @@ mod tests {
                 nonce: "nonce".into(),
                 aka_res_hex: "0011223344556677".into(),
                 call_id: "call-id".into(),
+                from_tag: "tag".into(),
                 cseq: 1,
                 contact_host: "2001:db8::10".parse().unwrap(),
                 contact_port: 5060,
@@ -313,6 +401,39 @@ mod tests {
         .unwrap();
         assert!(request.starts_with("REGISTER sip:ims.example SIP/2.0"));
         assert!(request.contains("algorithm=AKAv1-MD5"));
+    }
+
+    #[test]
+    fn keeps_initial_register_minimal_for_beta9_compatibility() {
+        let registration = SipRegistration {
+            private_identity: "460001234567890".into(),
+            public_identity: "sip:460001234567890@ims.example".into(),
+            realm: "ims.example".into(),
+            nonce: String::new(),
+            aka_res_hex: String::new(),
+            call_id: "call-id".into(),
+            from_tag: "tag".into(),
+            cseq: 1,
+            contact_host: "2001:db8::10".parse().unwrap(),
+            contact_port: 5062,
+        };
+        let request = build_initial_register(
+            &registration,
+            "branch",
+            "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=640f1102a98739",
+            &build_security_client_header(1, 2, 5062, 5060),
+        )
+        .unwrap();
+        assert!(request.contains("Contact: <sip:460001234567890@[2001:db8::10]:5062;"));
+        assert!(request.contains("Security-Client: ipsec-3gpp;"));
+        assert!(request.contains("P-Access-Network-Info: 3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=640f1102a98739\r\n"));
+        assert!(request.contains("P-Visited-Network-ID: \"example\"\r\n"));
+        assert!(request.contains("Authorization: Digest username="));
+        assert!(!request.contains("Accept-Contact:"));
+        assert!(!request.contains("P-Preferred-Service:"));
+        assert!(!request.contains("Supported:"));
+        assert!(!request.contains("Require:"));
+        assert!(request.contains("Authorization: Digest username=\"460001234567890\", realm=\"\", nonce=\"\", uri=\"sip:ims.example\", response=\"\", algorithm=AKAv1-MD5\r\n"));
     }
 
     #[test]
@@ -336,7 +457,7 @@ mod tests {
     fn builds_beta9_ipsec_security_header() {
         let header = build_security_client_header(1, 2, 5062, 5060);
         assert!(header.contains("alg=hmac-md5-96;ealg=null"));
-        assert!(header.contains("spi-c=0x00000001"));
+        assert!(header.contains("spi-c=1"));
     }
 
     #[test]

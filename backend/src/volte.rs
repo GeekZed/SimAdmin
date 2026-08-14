@@ -10,10 +10,13 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
+use std::process::Stdio;
+use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::task::JoinHandle;
 
 use anyhow::{anyhow, Result};
+use ring::rand::{SecureRandom, SystemRandom};
 use crate::config::ConfigManager;
 use crate::db::Database;
 use crate::notification::NotificationSender;
@@ -59,6 +62,31 @@ pub struct QmiBearerSettings {
     pub ipv6_address: String,
     pub ipv6_gateway: String,
     pub mtu: Option<u32>,
+}
+
+struct ActiveImsBearer {
+    child: Child,
+    settings: QmiBearerSettings,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperBearerSettings {
+    ipv6: String,
+    gateway: String,
+    mtu: Option<u32>,
+}
+
+fn parse_helper_bearer_settings(line: &str) -> Result<QmiBearerSettings> {
+    let settings: HelperBearerSettings = serde_json::from_str(line.trim())
+        .map_err(|error| anyhow!("invalid QMI helper bearer JSON: {error}"))?;
+    if settings.ipv6.trim().is_empty() || settings.gateway.trim().is_empty() {
+        return Err(anyhow!("QMI helper bearer JSON has no IPv6 address or gateway"));
+    }
+    Ok(QmiBearerSettings {
+        ipv6_address: settings.ipv6,
+        ipv6_gateway: settings.gateway,
+        mtu: settings.mtu,
+    })
 }
 
 /// Parse the stable fields emitted by `qmicli --wds-get-current-settings`.
@@ -152,6 +180,17 @@ pub fn parse_qmi_packet_handle(output: &str) -> Option<String> {
     })
 }
 
+pub fn parse_qmi_client_id(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (label, value) = line.split_once(':')?;
+        if label.trim() != "CID" {
+            return None;
+        }
+        let value = value.trim().trim_matches('\'');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
 pub fn secondary_netdev(qmi_device: &str) -> String {
     if let Ok(value) = std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV") {
         if !value.trim().is_empty() {
@@ -182,11 +221,68 @@ pub fn parse_qmi_connection_status(output: &str) -> Option<bool> {
 pub async fn start_secondary_ims_bearer(
     qmi_device: &str,
     apn: &str,
-) -> Result<(String, QmiBearerSettings)> {
+) -> Result<(String, String, QmiBearerSettings)> {
     if qmi_device.trim().is_empty() || apn.trim().is_empty() {
         return Err(anyhow!("QMI device and IMS APN are required"));
     }
 
+    let mut cid = None;
+    let mut last_family_error = String::new();
+    for _ in 0..3 {
+        let noop = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("qmicli")
+                .kill_on_drop(true)
+                .args([
+                    "-d",
+                    qmi_device,
+                    "--device-open-proxy",
+                    "--device-open-qmi",
+                    "--client-no-release-cid",
+                    "--wds-noop",
+                ])
+                .output(),
+        )
+        .await;
+        let Ok(Ok(noop)) = noop else {
+            last_family_error = "timed out allocating secondary IMS WDS client".to_string();
+            continue;
+        };
+        if !noop.status.success() {
+            last_family_error = String::from_utf8_lossy(&noop.stderr).trim().to_string();
+            continue;
+        }
+        let Some(candidate) = parse_qmi_client_id(&String::from_utf8_lossy(&noop.stdout)) else {
+            last_family_error = "qmicli did not return a secondary IMS WDS client id".to_string();
+            continue;
+        };
+        let family = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new("qmicli")
+                .kill_on_drop(true)
+                .args([
+                    "-d",
+                    qmi_device,
+                    "--device-open-proxy",
+                    "--device-open-qmi",
+                    &format!("--client-cid={candidate}"),
+                    "--wds-set-ip-family=6",
+                ])
+                .output(),
+        )
+        .await;
+        match family {
+            Ok(Ok(output)) if output.status.success() => {
+                cid = Some(candidate);
+                break;
+            }
+            Ok(Ok(output)) => last_family_error = String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            _ => last_family_error = "timed out setting secondary IMS IPv6 family".to_string(),
+        }
+    }
+    let cid = cid.ok_or_else(|| anyhow!("secondary IMS IPv6 family setup failed: {last_family_error}"))?;
+
+    // The native DATA6 path in beta9 uses the modem's IMS WDS profile.
     let start_arg = format!("--wds-start-network=apn={apn},3gpp-profile=1,ip-type=6");
     let output = tokio::time::timeout(
         Duration::from_secs(30),
@@ -195,9 +291,10 @@ pub async fn start_secondary_ims_bearer(
             .args([
                 "-d",
                 qmi_device,
+                "--device-open-proxy",
                 "--device-open-qmi",
                 "--device-open-net=net-raw-ip|net-no-qos-header",
-                "--client-no-release-cid",
+                &format!("--client-cid={cid}"),
                 &start_arg,
             ])
             .output(),
@@ -216,48 +313,78 @@ pub async fn start_secondary_ims_bearer(
     let handle = parse_qmi_packet_handle(&stdout)
         .ok_or_else(|| anyhow!("qmicli did not return a packet data handle"))?;
     let mut last_error = None;
-    for attempt in 0..5 {
-        match read_secondary_bearer_settings(qmi_device).await {
-            Ok(settings) => return Ok((handle, settings)),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt == 0 {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(30),
-                        Command::new("qmicli")
-                            .kill_on_drop(true)
-                            .args([
-                                "-d",
-                                qmi_device,
-                                "--device-open-qmi",
-                                "--device-open-net=net-raw-ip|net-no-qos-header",
-                                "--client-no-release-cid",
-                                &start_arg,
-                            ])
-                            .output(),
-                    )
-                    .await;
-                }
-            }
+    for _ in 0..5 {
+        match read_secondary_bearer_settings(qmi_device, Some(&cid)).await {
+            Ok(settings) => return Ok((cid, handle, settings)),
+            Err(error) => last_error = Some(error),
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    let _ = stop_secondary_ims_bearer(qmi_device, &handle).await;
+    let _ = stop_secondary_ims_bearer(qmi_device, Some(&cid), &handle).await;
     Err(last_error.unwrap_or_else(|| anyhow!("secondary IMS bearer settings unavailable")))
 }
 
-pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBearerSettings> {
+async fn start_secondary_ims_bearer_helper(qmi_device: &str) -> Result<ActiveImsBearer> {
+    let helper = std::env::var("SIMADMIN_QMI_IMS_HELPER")
+        .unwrap_or_else(|_| "/opt/simadmin/qmi-ims-helper".to_string());
+    let (child, settings) = tokio::time::timeout(
+        Duration::from_secs(45),
+        async {
+            let mut child = Command::new(&helper)
+                .arg(qmi_device)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|error| anyhow!("failed to start {helper}: {error}"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow!("{helper} did not expose stdout"))?;
+            let mut line = String::new();
+            BufReader::new(stdout).read_line(&mut line).await?;
+        let settings = parse_helper_bearer_settings(&line)?;
+            Ok::<_, anyhow::Error>((child, settings))
+        },
+    )
+    .await
+    .map_err(|_| anyhow!("timed out starting secondary IMS bearer helper"))??;
+    Ok(ActiveImsBearer {
+        child,
+        settings,
+    })
+}
+
+async fn configure_ims_pdp_context(conn: &Connection, modem_path: &str) -> Result<()> {
+    // beta9 prepares the modem IMS PDP context before issuing the DATA6 WDS
+    // request.  CID 4 is the IMS context reported by CGCONTRDP on this modem.
+    for command in [
+        r#"AT+CGDCONT=4,"IPV6","ims""#,
+        "AT$QCPDPIMSCFGE=4,1,1,1",
+    ] {
+        crate::modem_manager::send_at_command(conn, modem_path, command)
+            .await
+            .map_err(|error| anyhow!("IMS PDP setup failed for {command}: {error}"))?;
+    }
+    Ok(())
+}
+
+pub async fn read_secondary_bearer_settings(qmi_device: &str, cid: Option<&str>) -> Result<QmiBearerSettings> {
+    let mut args = vec!["-d".to_string(), qmi_device.to_string()];
+    if cid.is_some() {
+        args.push("--device-open-proxy".to_string());
+    }
+    args.push("--device-open-qmi".to_string());
+    args.push("--device-open-net=net-raw-ip|net-no-qos-header".to_string());
+    if let Some(cid) = cid.filter(|value| !value.is_empty()) {
+        args.push(format!("--client-cid={cid}"));
+    }
+    args.push("--wds-get-current-settings".to_string());
     let output = tokio::time::timeout(
         Duration::from_secs(15),
         Command::new("qmicli")
             .kill_on_drop(true)
-            .args([
-                "-d",
-                qmi_device,
-                "--device-open-qmi",
-                "--device-open-net=net-raw-ip|net-no-qos-header",
-                "--wds-get-current-settings",
-            ])
+            .args(&args)
             .output(),
     )
     .await
@@ -274,11 +401,22 @@ pub async fn read_secondary_bearer_settings(qmi_device: &str) -> Result<QmiBeare
         .ok_or_else(|| anyhow!("secondary IMS bearer did not provide IPv6 settings"))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NativeImsRuntime {
+    pub receive_port: u16,
+    pub send_port: u16,
+}
+
+fn allocate_local_udp_port(local: std::net::Ipv6Addr) -> Result<u16> {
+    let socket = std::net::UdpSocket::bind((local, 0))?;
+    Ok(socket.local_addr()?.port())
+}
+
 pub async fn register_native_ims(
     conn: &Connection,
     settings: &QmiBearerSettings,
     pcscf: std::net::Ipv6Addr,
-) -> Result<()> {
+) -> Result<NativeImsRuntime> {
     let local: std::net::Ipv6Addr = settings
         .ipv6_address
         .parse()
@@ -294,7 +432,9 @@ pub async fn register_native_ims(
     }
     let domain = std::env::var("SIMADMIN_IMS_DOMAIN").unwrap_or_else(|_| {
         let mcc = &identity.imsi[..3.min(identity.imsi.len())];
-        let mnc = if identity.imsi.len() >= 6 {
+        let mnc = if identity.imsi.starts_with("46011") {
+            "011"
+        } else if identity.imsi.len() >= 6 {
             &identity.imsi[3..6]
         } else {
             "000"
@@ -302,33 +442,74 @@ pub async fn register_native_ims(
         format!("ims.mnc{mnc}.mcc{mcc}.3gppnetwork.org")
     });
     let public_identity = format!("sip:{}@{}", identity.imsi, domain);
+    let access_network_info = crate::modem_manager::get_cell_location(conn)
+        .await
+        .ok()
+        .and_then(|location| location.cell_info)
+        .and_then(|cell| {
+            crate::ims_sip::build_lte_access_network_info(&cell.mcc, &cell.mnc, cell.cid)
+        })
+        .unwrap_or_else(|| "3GPP-E-UTRAN-FDD".to_string());
+    // The initial REGISTER is sent from the modem-compatible SIP port.  After
+    // the 401 challenge, beta9 moves the runtime to two negotiated local ports:
+    // one for inbound SIP and one for outbound protected SIP.
+    let initial_port = 5060;
+    let call_id_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
     let mut registration = crate::ims_sip::SipRegistration {
         private_identity: identity.imsi.clone(),
         public_identity,
         realm: domain,
         nonce: String::new(),
         aka_res_hex: String::new(),
-        call_id: format!(
-            "simadmin-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default()
-        ),
+        call_id: format!("simadmin-{call_id_suffix}@simadmin-volte"),
+        from_tag: format!("{call_id_suffix:016x}"),
         cseq: 1,
         contact_host: local,
-        contact_port: 5062,
+        contact_port: initial_port,
     };
-    let initial = crate::ims_sip::build_initial_register(&registration, "z9hG4bK-simadmin")?;
-    let challenge_response = crate::ims_sip::send_udp_request_from_port(
-        local,
-        5062,
-        pcscf,
+    let mut spi_bytes = [0u8; 8];
+    SystemRandom::new()
+        .fill(&mut spi_bytes)
+        .map_err(|_| anyhow!("failed to generate IMS security proposal"))?;
+    let security_header = crate::ims_sip::build_security_client_header(
+        u32::from_be_bytes(spi_bytes[..4].try_into().unwrap()),
+        u32::from_be_bytes(spi_bytes[4..].try_into().unwrap()),
+        initial_port,
         5060,
-        &initial,
-    )
-    .await?;
+    );
+    let mut challenge_response = None;
+    for attempt in 0..3 {
+        let initial = crate::ims_sip::build_initial_register(
+            &registration,
+            &format!("z9hG4bK-simadmin-{attempt}"),
+            &access_network_info,
+            &security_header,
+        )?;
+        let response = crate::ims_sip::send_udp_request_from_port(
+            local,
+            initial_port,
+            pcscf,
+            5060,
+            &initial,
+        )
+        .await?;
+        if crate::ims_sip::sip_status_code(&response) == Some(500) && attempt < 2 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        challenge_response = Some(response);
+        break;
+    }
+    let challenge_response = challenge_response
+        .ok_or_else(|| anyhow!("IMS initial REGISTER produced no response"))?;
     if crate::ims_sip::sip_status_code(&challenge_response) != Some(401) {
+        tracing::warn!(
+            response = %challenge_response.lines().take(12).collect::<Vec<_>>().join(" | "),
+            "IMS initial REGISTER response"
+        );
         return Err(anyhow!(
             "IMS initial REGISTER returned {:?}",
             crate::ims_sip::sip_status_code(&challenge_response)
@@ -338,12 +519,12 @@ pub async fn register_native_ims(
         .ok_or_else(|| anyhow!("IMS 401 did not contain an AKA challenge"))?;
     let security = crate::ims_sip::parse_security_server(&challenge_response)
         .ok_or_else(|| anyhow!("IMS 401 did not contain Security-Server"))?;
-    let aka_command = crate::ims_uim::build_aka_auth_command(&challenge.nonce)?;
+    let aka_apdu = crate::ims_uim::build_aka_auth_apdu(&challenge.nonce)?;
     let aka_output = crate::modem_manager::send_uim_apdu(
         conn,
         &modem_path,
         "A0000000871002",
-        &aka_command,
+        &aka_apdu,
         true,
     )
         .await
@@ -352,14 +533,19 @@ pub async fn register_native_ims(
     let aka = crate::ims_uim::parse_aka_response(&aka_hex)?
         .map_err(|_| anyhow!("IMS AKA requested AUTS resynchronization"))?;
     let ik_hex = crate::ims_uim::encode_hex(&aka.ik);
+    let receive_port = allocate_local_udp_port(local)?;
+    let mut send_port = allocate_local_udp_port(local)?;
+    if send_port == receive_port {
+        send_port = allocate_local_udp_port(local)?;
+    }
     crate::ims_ipsec::install_bidirectional_esp(
         local,
         pcscf,
         security.client_spi,
         security.server_spi,
         &ik_hex,
-        security.client_port,
-        security.client_port,
+        send_port,
+        receive_port,
         security.server_port,
         security.server_port,
     )
@@ -374,6 +560,7 @@ pub async fn register_native_ims(
         security.client_port,
         security.server_port,
     );
+    registration.contact_port = receive_port;
     let authenticated = crate::ims_sip::build_register_with_security(
         &registration,
         "z9hG4bK-simadmin-auth",
@@ -381,7 +568,7 @@ pub async fn register_native_ims(
     )?;
     let registered = crate::ims_sip::send_udp_request_from_port(
         local,
-        security.client_port,
+        send_port,
         pcscf,
         security.server_port,
         &authenticated,
@@ -393,20 +580,27 @@ pub async fn register_native_ims(
             crate::ims_sip::sip_status_code(&registered)
         ));
     }
-    Ok(())
+    Ok(NativeImsRuntime {
+        receive_port,
+        send_port,
+    })
 }
 
-pub async fn secondary_ims_bearer_connected(qmi_device: &str) -> Result<bool> {
+pub async fn secondary_ims_bearer_connected(qmi_device: &str, cid: Option<&str>) -> Result<bool> {
+    let mut args = vec![
+        "-d".to_string(), qmi_device.to_string(),
+        "--device-open-proxy".to_string(),
+        "--device-open-qmi".to_string(),
+    ];
+    if let Some(cid) = cid.filter(|value| !value.is_empty()) {
+        args.push(format!("--client-cid={cid}"));
+    }
+    args.push("--wds-get-packet-service-status".to_string());
     let output = tokio::time::timeout(
         Duration::from_secs(15),
         Command::new("qmicli")
             .kill_on_drop(true)
-            .args([
-                "-d",
-                qmi_device,
-                "--device-open-qmi",
-                "--wds-get-packet-service-status",
-            ])
+            .args(&args)
             .output(),
     )
     .await
@@ -423,23 +617,27 @@ pub async fn secondary_ims_bearer_connected(qmi_device: &str) -> Result<bool> {
         .ok_or_else(|| anyhow!("secondary IMS bearer status was not recognized"))
 }
 
-pub async fn stop_secondary_ims_bearer(qmi_device: &str, packet_handle: &str) -> Result<()> {
+pub async fn stop_secondary_ims_bearer(qmi_device: &str, cid: Option<&str>, packet_handle: &str) -> Result<()> {
     if qmi_device.trim().is_empty() || packet_handle.trim().is_empty() {
         return Err(anyhow!("QMI device and packet handle are required"));
     }
 
     let stop_arg = format!("--wds-stop-network={packet_handle}");
+    let mut args = vec![
+        "-d".to_string(), qmi_device.to_string(),
+        "--device-open-proxy".to_string(),
+        "--device-open-qmi".to_string(),
+        "--device-open-net=net-raw-ip|net-no-qos-header".to_string(),
+    ];
+    if let Some(cid) = cid.filter(|value| !value.is_empty()) {
+        args.push(format!("--client-cid={cid}"));
+    }
+    args.push(stop_arg);
     let output = tokio::time::timeout(
         Duration::from_secs(30),
         Command::new("qmicli")
             .kill_on_drop(true)
-            .args([
-                "-d",
-                qmi_device,
-                "--device-open-qmi",
-                "--device-open-net=net-raw-ip|net-no-qos-header",
-                &stop_arg,
-            ])
+            .args(&args)
             .output(),
     )
     .await
@@ -461,7 +659,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
     database: Arc<Database>,
     notifications: Arc<NotificationSender>,
 ) {
-    let mut active: Option<(String, String)> = None;
+    let mut active: Option<ActiveImsBearer> = None;
     let mut sms_listener: Option<JoinHandle<()>> = None;
 
     loop {
@@ -470,8 +668,8 @@ pub async fn run_secondary_ims_bearer_supervisor(
             if let Some(listener) = sms_listener.take() {
                 listener.abort();
             }
-            if let Some((device, handle)) = active.take() {
-                let _ = stop_secondary_ims_bearer(&device, &handle).await;
+            if let Some(mut bearer) = active.take() {
+                let _ = bearer.child.kill().await;
             }
             let _ = write_runtime_status(&RuntimeStatus {
                 phase: "disabled".to_string(),
@@ -503,27 +701,43 @@ pub async fn run_secondary_ims_bearer_supervisor(
             };
             let netdev = secondary_netdev(&device);
 
+            let modem_path = match crate::modem_manager::find_modem_path(&conn).await {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = write_runtime_status(&RuntimeStatus {
+                        phase: "waiting_for_modem".to_string(),
+                        transport: "native_qmi".to_string(),
+                        interface: netdev.clone(),
+                        last_error: error.to_string(),
+                        ..RuntimeStatus::default()
+                    });
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
             let _ = write_runtime_status(&RuntimeStatus {
                 phase: "starting_ims_bearer".to_string(),
                 transport: "native_qmi".to_string(),
                 interface: netdev.clone(),
                 ..RuntimeStatus::default()
             });
-            match start_secondary_ims_bearer(&device, "ims").await {
-                Ok((handle, settings)) => {
-                    active = Some((device.clone(), handle.clone()));
+            if let Err(error) = configure_ims_pdp_context(&conn, &modem_path).await {
+                tracing::warn!(error = %error, "IMS PDP context setup failed");
+            }
+            match start_secondary_ims_bearer_helper(&device).await {
+                Ok(bearer) => {
+                    let settings = bearer.settings.clone();
+                    active = Some(bearer);
                     let mut pcscf_address = None;
                     let _ = write_runtime_status(&RuntimeStatus {
                         phase: "usim_aid_selecting".to_string(),
                         transport: "native_qmi".to_string(),
                         ..RuntimeStatus::default()
                     });
-                    match crate::modem_manager::find_modem_path(&conn).await {
-                        Ok(modem_path) => {
-                            let command = match crate::ims_uim::build_csim_command(
-                                "00A4040007A0000000871002",
-                            ) {
-                                Ok(command) => command,
+                    {
+                        let apdu = "00A4040007A0000000871002";
+                        let command = match crate::ims_uim::build_csim_command(apdu) {
+                                Ok(_) => apdu,
                                 Err(error) => {
                                     let _ = write_runtime_status(&RuntimeStatus {
                                         phase: "degraded".to_string(),
@@ -533,51 +747,42 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                     });
                                     continue;
                                 }
-                            };
-                            match crate::modem_manager::send_uim_apdu(
-                                &conn,
-                                &modem_path,
-                                "A0000000871002",
-                                &command,
-                                false,
-                            )
-                            .await
-                            {
-                                Ok(response) => match crate::ims_uim::extract_csim_hex(&response)
-                                    .and_then(|hex| {
-                                        crate::ims_uim::parse_aid_from_select_response(&hex)
-                                            .map(|_| ())
-                                    }) {
-                                    Ok(()) => {}
-                                    Err(error) => {
-                                        let _ = write_runtime_status(&RuntimeStatus {
-                                            phase: "degraded".to_string(),
-                                            transport: "native_qmi".to_string(),
-                                            last_error: error.to_string(),
-                                            ..RuntimeStatus::default()
-                                        });
-                                    }
-                                },
+                        };
+                        match crate::modem_manager::send_uim_apdu(
+                            &conn,
+                            &modem_path,
+                            "A0000000871002",
+                            command,
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(response) => match crate::ims_uim::extract_csim_hex(&response)
+                                .and_then(|hex| {
+                                    crate::ims_uim::parse_aid_from_select_response(&hex)
+                                        .map(|_| ())
+                                }) {
+                                Ok(()) => {}
                                 Err(error) => {
                                     let _ = write_runtime_status(&RuntimeStatus {
                                         phase: "degraded".to_string(),
                                         transport: "native_qmi".to_string(),
-                                        last_error: error,
+                                        last_error: error.to_string(),
                                         ..RuntimeStatus::default()
                                     });
                                 }
                             }
-                        }
-                        Err(error) => {
-                            let _ = write_runtime_status(&RuntimeStatus {
-                                phase: "degraded".to_string(),
-                                transport: "native_qmi".to_string(),
-                                last_error: error.to_string(),
-                                ..RuntimeStatus::default()
-                            });
+                            Err(error) => {
+                                let _ = write_runtime_status(&RuntimeStatus {
+                                    phase: "degraded".to_string(),
+                                    transport: "native_qmi".to_string(),
+                                    last_error: error,
+                                    ..RuntimeStatus::default()
+                                });
+                            }
                         }
                     }
-                    if let Ok(modem_path) = crate::modem_manager::find_modem_path(&conn).await {
+                    {
                         match crate::modem_manager::send_at_command(
                             &conn,
                             &modem_path,
@@ -615,16 +820,18 @@ pub async fn run_secondary_ims_bearer_supervisor(
                         )
                         .await
                         {
+                            tracing::error!(error = %error, "Failed to configure native IMS IPv6 interface");
                             let _ = write_runtime_status(&RuntimeStatus {
                                 phase: "degraded".to_string(),
-                                transport: "native_qmi".to_string(),
+                                transport: "native_qmi_ipsec".to_string(),
                                 interface: netdev.clone(),
                                 last_error: error.to_string(),
                                 ..RuntimeStatus::default()
                             });
-                        } else {
-                            match register_native_ims(&conn, &settings, pcscf).await {
-                            Ok(()) => {
+                            continue;
+                        }
+                        match register_native_ims(&conn, &settings, pcscf).await {
+                            Ok(runtime) => {
                                 registration_succeeded = true;
                                 if volte.sms_enabled {
                                     let sms_local = settings.ipv6_address.parse().ok();
@@ -634,7 +841,8 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                         sms_listener = Some(tokio::spawn(async move {
                                             if let Err(error) = crate::ims_sms::run_ims_sms_listener(
                                                 sms_local,
-                                                5062,
+                                                runtime.receive_port,
+                                                runtime.send_port,
                                                 database_clone,
                                                 notifications_clone,
                                             )
@@ -655,6 +863,7 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                 });
                             }
                             Err(error) => {
+                                tracing::error!(error = %error, "Native VoLTE IMS registration failed");
                                 let _ = write_runtime_status(&RuntimeStatus {
                                     phase: "degraded".to_string(),
                                     transport: "native_qmi_ipsec".to_string(),
@@ -662,15 +871,14 @@ pub async fn run_secondary_ims_bearer_supervisor(
                                     ..RuntimeStatus::default()
                                 });
                             }
-                            }
                         }
                     }
                     if !registration_succeeded {
                         if let Some(listener) = sms_listener.take() {
                             listener.abort();
                         }
-                        if let Some((active_device, active_handle)) = active.take() {
-                            let _ = stop_secondary_ims_bearer(&active_device, &active_handle).await;
+                        if let Some(mut bearer) = active.take() {
+                            let _ = bearer.child.kill().await;
                         }
                         let _ = write_runtime_status(&RuntimeStatus {
                             phase: "degraded".to_string(),
@@ -678,9 +886,11 @@ pub async fn run_secondary_ims_bearer_supervisor(
                             interface: netdev.clone(),
                             ..RuntimeStatus::default()
                         });
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
                 Err(error) => {
+                    tracing::error!(error = %error, "Native VoLTE QMI helper failed");
                     let _ = write_runtime_status(&RuntimeStatus {
                         phase: "degraded".to_string(),
                         transport: "native_qmi".to_string(),
@@ -693,16 +903,16 @@ pub async fn run_secondary_ims_bearer_supervisor(
             continue;
         }
 
-        let (device, handle) = active.as_ref().expect("active bearer exists");
-        match secondary_ims_bearer_connected(device).await {
-            Ok(true) => {
+        let bearer = active.as_mut().expect("active bearer exists");
+        match bearer.child.try_wait() {
+            Ok(None) => {
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
-            Ok(false) | Err(_) => {
+            Ok(Some(_)) | Err(_) => {
                 if let Some(listener) = sms_listener.take() {
                     listener.abort();
                 }
-                let _ = stop_secondary_ims_bearer(device, handle).await;
+                let _ = bearer.child.kill().await;
                 active = None;
                 let _ = write_runtime_status(&RuntimeStatus {
                     phase: "degraded".to_string(),
@@ -736,6 +946,21 @@ mod tests {
                 ipv6_gateway: "2001:db8::1".to_string(),
                 mtu: Some(1432),
             })
+        );
+    }
+
+    #[test]
+    fn parses_native_qmi_helper_json() {
+        assert_eq!(
+            super::parse_helper_bearer_settings(
+                r#"{"phase":"bearer_up","ipv6":"2001:db8::10","gateway":"2001:db8::1","mtu":1432}"#
+            )
+            .unwrap(),
+            super::QmiBearerSettings {
+                ipv6_address: "2001:db8::10".to_string(),
+                ipv6_gateway: "2001:db8::1".to_string(),
+                mtu: Some(1432),
+            }
         );
     }
 

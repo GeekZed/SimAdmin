@@ -41,12 +41,19 @@ pub fn extract_csim_hex(response: &str) -> Result<String> {
     let value = response
         .split('"')
         .nth(1)
-        .ok_or_else(|| anyhow!("Modem response did not contain CSIM hex data"))?;
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| response.trim());
     decode_hex(value)?;
     Ok(value.to_string())
 }
 
 pub fn build_aka_auth_command(nonce: &str) -> Result<String> {
+    let apdu = build_aka_auth_apdu(nonce)?;
+    Ok(format!("AT+CSIM={},\"{}\"", apdu.len(), apdu))
+}
+
+pub fn build_aka_auth_apdu(nonce: &str) -> Result<String> {
     let nonce = nonce.trim().trim_matches('"');
     let auth_data = STANDARD
         .decode(nonce)
@@ -60,7 +67,7 @@ pub fn build_aka_auth_command(nonce: &str) -> Result<String> {
         encode_hex(&auth_data[..16]),
         encode_hex(&auth_data[16..])
     );
-    build_csim_command(&apdu)
+    Ok(apdu)
 }
 
 pub fn encode_hex(bytes: &[u8]) -> String {
@@ -143,6 +150,14 @@ mod tests {
         assert_eq!(
             extract_csim_hex(r#"+CSIM: 144,0,"62098407A0000000871002""#).unwrap(),
             "62098407A0000000871002"
+        );
+    }
+
+    #[test]
+    fn extracts_raw_uim_helper_response_hex() {
+        assert_eq!(
+            extract_csim_hex("DB02AABB DC02CCDD DD02EEFF 9000").unwrap(),
+            "DB02AABB DC02CCDD DD02EEFF 9000"
         );
     }
 

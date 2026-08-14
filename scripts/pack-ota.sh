@@ -108,6 +108,10 @@ echo "📋 复制前端文件..."
 mkdir -p "$OTA_TMP/www"
 cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 
+# Keep the native helper source with the OTA package; the target builds it
+# against its installed libqmi-glib development files.
+cp scripts/qmi-ims-helper.c "$OTA_TMP/qmi-ims-helper.c"
+
 # 计算前端 MD5（所有文件的 hash，与 Rust 验证逻辑一致）
 # 方式：每个文件的 MD5 排序后，用换行符连接，再计算整体 MD5
 echo "📋 计算前端 MD5..."
@@ -151,7 +155,7 @@ mkdir -p release
 OTA_FILE="release/simadmin_${VERSION}_${TARGET}.tar.gz"
 echo "📦 打包 OTA 更新包..."
 cd "$OTA_TMP"
-tar -czf - meta.json simadmin www > "$OLDPWD/$OTA_FILE"
+tar -czf - meta.json simadmin qmi-ims-helper.c www > "$OLDPWD/$OTA_FILE"
 cd "$OLDPWD"
 
 # 显示结果
